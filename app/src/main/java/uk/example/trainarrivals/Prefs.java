@@ -55,6 +55,28 @@ final class Prefs {
                 .apply();
     }
 
+    static String loadNrKey(Context c) {
+        return c.getSharedPreferences(FILE, Context.MODE_PRIVATE).getString("nrApiKey", "");
+    }
+
+    static String loadNrCrs(Context c) {
+        return c.getSharedPreferences(FILE, Context.MODE_PRIVATE).getString("nrCrs", "");
+    }
+
+    static void saveNationalRail(Context c, String key, String crs) {
+        c.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
+                .putString("nrApiKey", key == null ? "" : key.trim())
+                .putString("nrCrs", crs == null ? "" : crs.trim().toUpperCase(java.util.Locale.UK))
+                .apply();
+    }
+
+    /** Push all saved keys into the API client. */
+    static void applyKeys(Context c) {
+        Tfl.appKey = loadApiKey(c);
+        Tfl.nrKey = loadNrKey(c);
+        Tfl.nrCrs = loadNrCrs(c);
+    }
+
     boolean isConfigured() {
         return !lineId.isEmpty() && !stopId.isEmpty();
     }

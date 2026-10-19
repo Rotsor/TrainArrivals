@@ -49,7 +49,7 @@ public class SetupActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        Tfl.appKey = Prefs.loadApiKey(this);
+        Prefs.applyKeys(this);
         buildUi();
         showLines();
     }

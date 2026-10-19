@@ -1,9 +1,7 @@
 package uk.example.trainarrivals;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.app.Dialog;
-import android.widget.EditText;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -113,7 +111,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = Prefs.load(this);
-        Tfl.appKey = Prefs.loadApiKey(this);
+        Prefs.applyKeys(this);
         if (!prefs.isConfigured()) {
             openSetup();
             return;
@@ -128,6 +126,8 @@ public class MainActivity extends Activity {
         refresh.setOnClickListener(v -> manualRefresh());
         Button change = findViewById(R.id.change);
         change.setOnClickListener(v -> openSetup());
+        Button sources = findViewById(R.id.sources);
+        sources.setOnClickListener(v -> startActivity(new Intent(this, SourcesActivity.class)));
 
         lineColour = Color.parseColor(LINE_COLOURS.getOrDefault(prefs.lineId, "#6950A1"));
         int onColour = isLight(lineColour) ? 0xFF111111 : 0xFFFFFFFF;
@@ -138,7 +138,7 @@ public class MainActivity extends Activity {
         lineName.setText(prefs.lineName.toUpperCase(Locale.UK));
         stationName.setText(prefs.stopName);
         direction.setText(prefs.directionLabel());
-        for (TextView tv : new TextView[]{lineName, stationName, direction, change}) {
+        for (TextView tv : new TextView[]{lineName, stationName, direction, change, sources}) {
             tv.setTextColor(onColour);
         }
         getWindow().setStatusBarColor(lineColour);
@@ -153,6 +153,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (list == null) return;
+        Prefs.applyKeys(this); // may have changed on the Data sources screen
         main.post(fetchLoop);
         main.postDelayed(tickLoop, TICK_EVERY_MS);
     }
@@ -328,6 +329,12 @@ public class MainActivity extends Activity {
         if (!cancelled && t.scheduled != null && t.expected != null
                 && Duration.between(t.scheduled, t.expected).getSeconds() >= 60) {
             left.addView(text("Expected " + HHMM.format(t.expected), 14, getColor(R.color.amber), true));
+        } else if (!cancelled && "Delayed".equalsIgnoreCase(t.status)) {
+            left.addView(text(t.expectedUnknown ? "Delayed (no estimate yet)" : "Delayed",
+                    14, getColor(R.color.amber), true));
+        }
+        if (!cancelled && !t.cause.isEmpty()) {
+            left.addView(text(t.cause, 12, getColor(R.color.muted), false));
         }
 
         StringBuilder sub = new StringBuilder();
@@ -343,7 +350,7 @@ public class MainActivity extends Activity {
         if (sub.length() > 0) left.addView(text(sub.toString(), 13, getColor(R.color.muted), false));
 
         if (!t.note.isEmpty()) {
-            TextView note = text("⚠ " + t.note, 12, getColor(R.color.note), false);
+            TextView note = text("⚠ " + t.note.replace("\n", "\n⚠ "), 12, getColor(R.color.note), false);
             note.setTypeface(Typeface.defaultFromStyle(Typeface.ITALIC));
             note.setPadding(0, dp(3), 0, 0);
             left.addView(note);
@@ -413,6 +420,8 @@ public class MainActivity extends Activity {
         r.append("Showing: ").append(prefs.directionLabel()).append('\n');
         r.append("TfL API key: ").append(Tfl.appKey.isEmpty() ? "not set (anonymous, low rate limit)" : "set")
                 .append('\n');
+        r.append("National Rail: ").append(Tfl.nrKey.isEmpty() || Tfl.nrCrs.isEmpty()
+                ? "not set up" : "key set, station " + Tfl.nrCrs).append('\n');
         if (lastBoard.retryAfterSec > 0) {
             r.append("Rate limited: TfL asked to wait ").append(lastBoard.retryAfterSec).append(" s\n");
         }
@@ -427,6 +436,7 @@ public class MainActivity extends Activity {
                     .append(" · filtered ").append(f.drops.size()).append('\n');
             if (!f.error.isEmpty()) r.append("ERROR: ").append(f.error).append('\n');
             if (!f.statuses.isEmpty()) r.append("Statuses: ").append(f.statuses).append('\n');
+            for (String m : f.messages) r.append("Message: ").append(m).append('\n');
             if (!f.bodySnippet.isEmpty()) {
                 r.append("Response started with:\n").append(f.bodySnippet).append('\n');
             }
@@ -478,9 +488,9 @@ public class MainActivity extends Activity {
         close.setTextColor(onColour);
         close.setOnClickListener(v -> dialog.dismiss());
         Button key = new Button(this, null, 0, android.R.style.Widget_Material_Button_Borderless);
-        key.setText("API key");
+        key.setText("Keys");
         key.setTextColor(onColour);
-        key.setOnClickListener(v -> editApiKey());
+        key.setOnClickListener(v -> startActivity(new Intent(this, SourcesActivity.class)));
         bar.addView(title);
         bar.addView(key);
         bar.addView(copy);
@@ -499,27 +509,6 @@ public class MainActivity extends Activity {
 
         dialog.setContentView(root);
         dialog.show();
-    }
-
-    private void editApiKey() {
-        EditText input = new EditText(this);
-        input.setSingleLine(true);
-        input.setHint("Paste key from api-portal.tfl.gov.uk");
-        input.setText(Tfl.appKey);
-        input.setPadding(dp(20), dp(12), dp(20), dp(12));
-        new AlertDialog.Builder(this)
-                .setTitle("TfL API key")
-                .setMessage("Optional. A free key from api-portal.tfl.gov.uk gives a much higher "
-                        + "rate limit. It's stored only on this phone.")
-                .setView(input)
-                .setPositiveButton("Save", (d, w) -> {
-                    String k = input.getText().toString().trim();
-                    Prefs.saveApiKey(this, k);
-                    Tfl.appKey = k;
-                    Toast.makeText(this, k.isEmpty() ? "Key cleared" : "Key saved", Toast.LENGTH_SHORT).show();
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
     }
 
     private static boolean isLight(int c) {

@@ -34,6 +34,21 @@ final class Tfl {
      */
     static volatile String appKey = "";
 
+    /**
+     * Optional National Rail (Rail Data Marketplace) "Live Departure Board"
+     * consumer key and the station's 3-letter CRS code. Stored on the phone only.
+     */
+    static volatile String nrKey = "";
+    static volatile String nrCrs = "";
+
+    private static final String NR_BASE =
+            "https://api1.raildata.org.uk/1010-live-departure-board-dep1_2/LDBWS/api/20220120";
+
+    /** National Rail operator code for each TfL rail line. */
+    static String operatorFor(String lineId) {
+        return "elizabeth".equals(lineId) ? "XR" : "LO";
+    }
+
     /** TfL said "too many requests": how long it asked us to wait. */
     static final class RateLimited extends IOException {
         final int retryAfterSec;
@@ -70,8 +85,14 @@ final class Tfl {
         /** "", OnTime, Delayed, Cancelled or NotStoppingAtStation. */
         String status = "";
         String cause = "";
-        /** Where the two TfL feeds disagree about this train; "" if they agree. */
+        /** Where the feeds disagree about this train, one line each; "" if they agree. */
         String note = "";
+        /** True when the expected time isn't known (National Rail just says "Delayed"). */
+        boolean expectedUnknown = false;
+
+        void addNote(String n) {
+            note = note.isEmpty() ? n : note + "\n" + n;
+        }
 
         boolean isCancelled() {
             return "Cancelled".equalsIgnoreCase(status)
@@ -88,7 +109,7 @@ final class Tfl {
     static final class Board {
         List<Arrival> trains = new ArrayList<>();
         String sourceNote = "";
-        Feed depFeed, arrFeed;
+        Feed depFeed, arrFeed, nrFeed;
         /** Seconds TfL asked us to wait before trying again; 0 if not rate limited. */
         int retryAfterSec = 0;
         /** Every feed requested, in display order. */
@@ -113,6 +134,8 @@ final class Tfl {
         String bodySnippet = "";
         int raw = 0, kept = 0;
         final List<Drop> drops = new ArrayList<>();
+        /** Service messages (National Rail disruption notices). */
+        final List<String> messages = new ArrayList<>();
         /** departureStatus values seen on kept trains, with counts. */
         final Map<String, Integer> statuses = new LinkedHashMap<>();
 
@@ -340,7 +363,7 @@ final class Tfl {
      */
     static Board board(String stopId, String lineId) {
         Board b = new Board();
-        b.arrFeed = new Feed("Arrivals feed");
+        b.arrFeed = new Feed("TfL arrivals feed");
         b.feeds.add(b.arrFeed);
 
         if (!hasDepartureBoard(lineId)) {
@@ -350,7 +373,8 @@ final class Tfl {
             return b;
         }
 
-        b.depFeed = new Feed("Departure board");
+        // 1. TfL departure board.
+        b.depFeed = new Feed("TfL departure board");
         b.feeds.add(0, b.depFeed);
         List<Arrival> deps;
         try {
@@ -360,34 +384,54 @@ final class Tfl {
             noteRateLimit(b, e);
             deps = null;
         }
+
+        // 2. TfL arrivals feed (skipped if TfL just asked us to wait).
         List<Arrival> arrs;
         if (b.retryAfterSec > 0) {
-            // A second request now would only be refused too.
             b.arrFeed.error = "Skipped: TfL asked to wait";
             arrs = null;
         } else {
             arrs = tryArrivals(stopId, lineId, b.arrFeed, b);
         }
 
-        if (deps == null && arrs == null) {
-            b.sourceNote = "Both feeds failed. Board: " + b.depFeed.error
-                    + ". Arrivals: " + b.arrFeed.error;
-        } else if (deps == null) {
-            b.trains = arrs;
-            b.sourceNote = "Departure board failed (" + b.depFeed.error
-                    + "), so cancellations aren't shown";
-        } else if (arrs == null) {
-            b.trains = deps;
-            b.sourceNote = "Arrivals feed failed (" + b.arrFeed.error + "), so no cross-check";
-        } else if (deps.isEmpty() && !arrs.isEmpty()) {
-            b.trains = arrs;
-            for (Arrival a : arrs) a.note = "Only in the arrivals feed";
-            b.sourceNote = "Departure board had no usable trains (TfL sent "
-                    + b.depFeed.raw + "); showing the arrivals feed";
-        } else {
-            b.trains = deps;
-            crossCheck(deps, arrs);
+        // 3. National Rail, if the user set it up. Its own rate limit doesn't pause TfL.
+        List<Arrival> nr = null;
+        String nrKeyNow = nrKey, nrCrsNow = nrCrs;
+        if (!nrKeyNow.isEmpty() && !nrCrsNow.isEmpty()) {
+            b.nrFeed = new Feed("National Rail");
+            b.feeds.add(b.nrFeed);
+            try {
+                nr = nationalRail(nrCrsNow, nrKeyNow, lineId, b.nrFeed);
+            } catch (Exception e) {
+                b.nrFeed.fail(e);
+            }
         }
+
+        List<String> notes = new ArrayList<>();
+        if (deps == null) notes.add("TfL departure board failed (" + b.depFeed.error + ")");
+        else if (deps.isEmpty()) notes.add("TfL departure board had no usable trains (TfL sent " + b.depFeed.raw + ")");
+        if (arrs == null) notes.add("TfL arrivals feed failed (" + b.arrFeed.error + ")");
+        if (b.nrFeed != null && nr == null) notes.add("National Rail failed (" + b.nrFeed.error + ")");
+
+        // Main list: TfL board, else National Rail, else the arrivals feed.
+        List<Arrival> primary;
+        if (deps != null && !deps.isEmpty()) {
+            primary = deps;
+        } else if (nr != null && !nr.isEmpty()) {
+            primary = nr;
+            notes.add("Showing National Rail");
+        } else if (arrs != null) {
+            primary = arrs;
+            notes.add("Showing the arrivals feed, which doesn't show cancellations");
+        } else {
+            primary = deps != null ? deps : (nr != null ? nr : new ArrayList<>());
+        }
+
+        if (nr != null && primary != nr) crossCheckNationalRail(primary, nr, b.nrFeed);
+        if (arrs != null && primary != arrs) crossCheck(primary, arrs);
+
+        b.trains = primary;
+        b.sourceNote = String.join(". ", notes);
         return b;
     }
 
@@ -437,7 +481,7 @@ final class Tfl {
             if (best < 0) {
                 // The arrivals feed only looks ~30 min ahead; beyond that, absence means nothing.
                 if (!d.isCancelled() && horizon != null && !d.sortTime().isAfter(horizon)) {
-                    d.note = "Not in the arrivals feed";
+                    d.addNote("Not in the arrivals feed");
                 }
                 continue;
             }
@@ -446,9 +490,9 @@ final class Tfl {
             if (d.currentLocation.isEmpty()) d.currentLocation = a.currentLocation;
 
             if (d.isCancelled()) {
-                d.note = "Arrivals feed still shows it, due " + hhmm.format(a.expected);
+                d.addNote("Arrivals feed still shows it, due " + hhmm.format(a.expected));
             } else if (d.expected != null && secsBetween(a.expected, d.expected) >= reportGap) {
-                d.note = "Arrivals feed says " + hhmm.format(a.expected);
+                d.addNote("Arrivals feed says " + hhmm.format(a.expected));
             }
         }
 
@@ -456,10 +500,196 @@ final class Tfl {
         for (int i = 0; i < arrs.size(); i++) {
             if (used[i]) continue;
             Arrival a = arrs.get(i);
-            a.note = "Only in the arrivals feed";
+            a.addNote("Only in the arrivals feed");
             deps.add(a);
         }
         deps.sort((x, y) -> x.sortTime().compareTo(y.sortTime()));
+    }
+
+    /** National Rail departure board for a station (CRS), this line's operator only. */
+    static List<Arrival> nationalRail(String crs, String key, String lineId, Feed f) throws Exception {
+        String url = NR_BASE + "/GetDepartureBoard/" + enc(crs.toUpperCase(Locale.UK))
+                + "?numRows=60&timeWindow=120";
+        String body = requestUrl(f, url, url, "x-apikey", key);
+        return parseNationalRail(body, lineId, f, Instant.now());
+    }
+
+    /** Separate from the request so it can be tested with saved responses. */
+    static List<Arrival> parseNationalRail(String body, String lineId, Feed f, Instant now)
+            throws Exception {
+        JSONObject root;
+        try {
+            root = new JSONObject(body);
+        } catch (Exception e) {
+            f.bodySnippet = snippet(body);
+            throw new IOException("Response wasn't a departure board");
+        }
+
+        JSONArray msgs = root.optJSONArray("nrccMessages");
+        if (msgs != null) {
+            for (int i = 0; i < msgs.length(); i++) {
+                JSONObject m = msgs.optJSONObject(i);
+                String text = m == null ? String.valueOf(msgs.opt(i)) : m.optString("Value", m.toString());
+                f.messages.add(text.replaceAll("<[^>]+>", "").trim());
+            }
+        }
+
+        JSONArray svcs = root.optJSONArray("trainServices");
+        List<Arrival> out = new ArrayList<>();
+        if (svcs == null) return out; // no trains in the window: a valid, empty board
+        f.raw = svcs.length();
+        String wantOp = operatorFor(lineId);
+
+        for (int i = 0; i < svcs.length(); i++) {
+            JSONObject o = svcs.optJSONObject(i);
+            if (o == null) {
+                f.drop("Not a JSON object", String.valueOf(svcs.opt(i)), null);
+                continue;
+            }
+            String op = str(o, "operatorCode");
+            if (!op.isEmpty() && !op.equalsIgnoreCase(wantOp)) {
+                f.drop("Other operator", str(o, "operator") + " (" + op + ") → " + nrDest(o), o);
+                continue;
+            }
+            String std = str(o, "std"), etd = str(o, "etd");
+            Instant sched = clockTime(std, now);
+            if (sched == null) {
+                f.drop("Unreadable time", "std = \"" + std + "\", etd = \"" + etd + "\"", o);
+                continue;
+            }
+
+            Arrival a = new Arrival();
+            a.lineId = lineId;
+            a.scheduled = sched;
+            a.destination = cleanName(nrDest(o));
+            a.platform = cleanPlatform(str(o, "platform"));
+
+            boolean cancelled = o.optBoolean("isCancelled", false) || "Cancelled".equalsIgnoreCase(etd);
+            Instant est = clockTime(etd, sched); // "HH:mm" when it's a time
+            if (cancelled) {
+                a.status = "Cancelled";
+                a.expected = sched;
+                a.cause = str(o, "cancelReason");
+            } else if (est != null) {
+                a.expected = est;
+                a.status = est.isAfter(sched.plusSeconds(59)) ? "Delayed" : "OnTime";
+                a.cause = str(o, "delayReason");
+            } else if ("Delayed".equalsIgnoreCase(etd)) {
+                a.expected = sched;
+                a.expectedUnknown = true;
+                a.status = "Delayed";
+                a.cause = str(o, "delayReason");
+            } else { // "On time" or anything else
+                a.expected = sched;
+                a.status = "OnTime";
+            }
+            f.statuses.merge(etd.isEmpty() ? "(none)" : (est != null ? "HH:mm" : etd), 1, Integer::sum);
+            out.add(a);
+        }
+        out.sort((x, y) -> x.sortTime().compareTo(y.sortTime()));
+        f.kept = out.size();
+        return out;
+    }
+
+    private static String nrDest(JSONObject o) {
+        JSONArray d = o.optJSONArray("destination");
+        if (d == null || d.length() == 0) return "";
+        JSONObject first = d.optJSONObject(0);
+        return first == null ? "" : first.optString("locationName", "");
+    }
+
+    /** "21:35" as the nearest such London clock time to the reference instant. */
+    static Instant clockTime(String hhmm, Instant ref) {
+        if (hhmm == null || !hhmm.matches("\\d{1,2}:\\d{2}")) return null;
+        ZoneId london = ZoneId.of("Europe/London");
+        java.time.LocalTime t = java.time.LocalTime.parse(hhmm.length() == 4 ? "0" + hhmm : hhmm);
+        java.time.LocalDate day = ref.atZone(london).toLocalDate();
+        Instant best = null;
+        for (int d = -1; d <= 1; d++) {
+            Instant c = day.plusDays(d).atTime(t).atZone(london).toInstant();
+            if (best == null || secsBetween(c, ref) < secsBetween(best, ref)) best = c;
+        }
+        return best;
+    }
+
+    /**
+     * Match each train in the main list with National Rail's, note disagreements,
+     * and add trains only National Rail has (within the main list's time range).
+     */
+    private static void crossCheckNationalRail(List<Arrival> primary, List<Arrival> nr, Feed f) {
+        final long schedWindow = 2 * 60, expWindow = 5 * 60, reportGap = 3 * 60;
+        boolean[] used = new boolean[nr.size()];
+        Instant primaryEnd = null, nrEnd = null;
+        for (Arrival p : primary) {
+            if (primaryEnd == null || p.sortTime().isAfter(primaryEnd)) primaryEnd = p.sortTime();
+        }
+        for (Arrival n : nr) {
+            if (nrEnd == null || n.sortTime().isAfter(nrEnd)) nrEnd = n.sortTime();
+        }
+
+        for (Arrival p : primary) {
+            int best = -1;
+            long bestGap = Long.MAX_VALUE;
+            for (int i = 0; i < nr.size(); i++) {
+                if (used[i]) continue;
+                Arrival n = nr.get(i);
+                if (!norm(n.destination).equals(norm(p.destination))) continue;
+                long gap;
+                if (p.scheduled != null) {
+                    gap = secsBetween(p.scheduled, n.scheduled);
+                    if (gap > schedWindow) continue;
+                } else {
+                    gap = secsBetween(p.sortTime(), n.sortTime());
+                    if (gap > expWindow) continue;
+                }
+                if (gap < bestGap) {
+                    best = i;
+                    bestGap = gap;
+                }
+            }
+
+            if (best < 0) {
+                if (!p.isCancelled() && nrEnd != null && !p.sortTime().isAfter(nrEnd)) {
+                    p.addNote("Not on National Rail");
+                }
+                continue;
+            }
+            used[best] = true;
+            Arrival n = nr.get(best);
+
+            if (n.isCancelled() && !p.isCancelled()) {
+                p.addNote("National Rail: cancelled" + (n.cause.isEmpty() ? "" : " (" + n.cause + ")"));
+            } else if (!n.isCancelled() && p.isCancelled()) {
+                p.addNote("National Rail shows it running");
+            } else if (!n.isCancelled()) {
+                if (n.expectedUnknown && p.expected != null && p.scheduled != null
+                        && !p.expected.isAfter(p.scheduled.plusSeconds(59))) {
+                    p.addNote("National Rail: delayed");
+                } else if (!n.expectedUnknown && p.expected != null
+                        && secsBetween(n.expected, p.expected) >= reportGap) {
+                    p.addNote("National Rail expects " + HHMM.format(n.expected));
+                }
+            }
+            if (p.platform.isEmpty()) {
+                p.platform = n.platform;
+            } else if (!n.platform.isEmpty() && !n.platform.equalsIgnoreCase(p.platform)) {
+                p.addNote("National Rail: " + n.platform);
+            }
+            // Borrow the reason only when both agree on whether it's cancelled.
+            if (p.cause.isEmpty() && n.isCancelled() == p.isCancelled()) p.cause = n.cause;
+        }
+
+        for (int i = 0; i < nr.size(); i++) {
+            if (used[i]) continue;
+            Arrival n = nr.get(i);
+            if (primaryEnd != null && !n.sortTime().isAfter(primaryEnd)) {
+                n.addNote("Only on National Rail");
+                primary.add(n);
+            } else {
+                f.drop("Later than TfL's list", n.destination + " at " + HHMM.format(n.sortTime()), null);
+            }
+        }
+        primary.sort((x, y) -> x.sortTime().compareTo(y.sortTime()));
     }
 
     private static long secsBetween(Instant a, Instant b) {
@@ -530,17 +760,24 @@ final class Tfl {
     }
 
     private static String request(Feed f, String path) throws Exception {
-        String url = BASE + path;
-        f.url = url;
+        String shown = BASE + path;
+        String url = shown;
         String key = appKey;
         if (key != null && !key.isEmpty()) {
             url += (url.contains("?") ? "&" : "?") + "app_key=" + URLEncoder.encode(key, "UTF-8");
         }
+        return requestUrl(f, url, shown, null, null);
+    }
 
+    /** GET a URL; `shown` is what the details screen displays (never contains keys). */
+    private static String requestUrl(Feed f, String url, String shown,
+                                     String headerName, String headerValue) throws Exception {
+        f.url = shown;
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(10_000);
         c.setReadTimeout(20_000);
         c.setRequestProperty("Accept", "application/json");
+        if (headerName != null) c.setRequestProperty(headerName, headerValue);
         try {
             int code = c.getResponseCode();
             f.httpCode = code;

@@ -32,11 +32,20 @@ install `app-debug.apk` (allow "install unknown apps" when asked).
 
 Or open the project in Android Studio and press Run.
 
-## TfL rate limit and API key
-Without a key, TfL allows only a small number of requests, shared by everyone
-on the same network address. If TfL says "too many requests", the app waits
-as long as TfL asks before trying again and keeps showing the last list.
+## Data sources and keys
+Tap **Sources** on the main screen for the full explanation and to enter keys.
+Both keys are optional, free, and stored only on the phone, never in this
+repository.
 
-For a much higher limit, get a free key at https://api-portal.tfl.gov.uk and
-enter it via the "filtered out / details" line → **API key**. The key is stored
-only on the phone, never in this repository.
+- **TfL** (always used). Without a key TfL allows only a few requests,
+  shared by everyone on the same network address. If TfL says "too many
+  requests", the app waits as long as TfL asks and keeps showing the last
+  list. A free key from https://api-portal.tfl.gov.uk lifts the limit.
+- **National Rail** (optional, Elizabeth line and Overground only). The Live
+  Departure Board from the Rail Data Marketplace (https://raildata.org.uk),
+  plus your station's 3-letter CRS code. It's compared with TfL, and a ⚠ note
+  marks trains where they disagree (e.g. cancelled on one, running on the
+  other). If TfL's departure board fails, National Rail is shown instead.
+
+The "filtered out — details ›" line under the status opens a full report of
+every request, error and entry that wasn't shown.
