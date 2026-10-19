@@ -44,6 +44,17 @@ final class Prefs {
                 .apply();
     }
 
+    /** Kept apart from the station choice so re-running setup never clears it. */
+    static String loadApiKey(Context c) {
+        return c.getSharedPreferences(FILE, Context.MODE_PRIVATE).getString("tflApiKey", "");
+    }
+
+    static void saveApiKey(Context c, String key) {
+        c.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
+                .putString("tflApiKey", key == null ? "" : key.trim())
+                .apply();
+    }
+
     boolean isConfigured() {
         return !lineId.isEmpty() && !stopId.isEmpty();
     }

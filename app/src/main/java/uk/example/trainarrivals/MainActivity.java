@@ -1,7 +1,9 @@
 package uk.example.trainarrivals;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.Dialog;
+import android.widget.EditText;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -39,6 +41,8 @@ public class MainActivity extends Activity {
 
     private static final long FETCH_EVERY_MS = 30_000;
     private static final long TICK_EVERY_MS = 5_000;
+    /** Minimum gap between manual refreshes: each one is two TfL requests. */
+    private static final long MIN_MANUAL_GAP_MS = 10_000;
 
     private static final ZoneId LONDON = ZoneId.of("Europe/London");
     private static final DateTimeFormatter HHMM = DateTimeFormatter.ofPattern("HH:mm").withZone(LONDON);
@@ -85,6 +89,11 @@ public class MainActivity extends Activity {
     private Tfl.Board lastBoard;
     private Instant lastBoardAt;
     private TextView filtered;
+    /** Until when TfL asked us not to call (HTTP 429). */
+    private Instant backoffUntil;
+    private Instant lastFetchStart;
+
+    private final Runnable retryAfterBackoff = this::fetch;
 
     private final Runnable fetchLoop = new Runnable() {
         @Override public void run() {
@@ -104,6 +113,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = Prefs.load(this);
+        Tfl.appKey = Prefs.loadApiKey(this);
         if (!prefs.isConfigured()) {
             openSetup();
             return;
@@ -115,7 +125,7 @@ public class MainActivity extends Activity {
         filtered = findViewById(R.id.filtered);
         filtered.setOnClickListener(v -> showDetails());
         Button refresh = findViewById(R.id.refresh);
-        refresh.setOnClickListener(v -> fetch());
+        refresh.setOnClickListener(v -> manualRefresh());
         Button change = findViewById(R.id.change);
         change.setOnClickListener(v -> openSetup());
 
@@ -152,6 +162,7 @@ public class MainActivity extends Activity {
         super.onPause();
         main.removeCallbacks(fetchLoop);
         main.removeCallbacks(tickLoop);
+        main.removeCallbacks(retryAfterBackoff);
     }
 
     @Override
@@ -162,9 +173,32 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- network
 
+    private void manualRefresh() {
+        Instant now = Instant.now();
+        long wait = backoffSecondsLeft(now);
+        if (wait > 0) {
+            Toast.makeText(this, "TfL asked to wait — retrying in " + wait + " s", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (lastFetchStart != null
+                && now.toEpochMilli() - lastFetchStart.toEpochMilli() < MIN_MANUAL_GAP_MS) {
+            Toast.makeText(this, "Just refreshed — the list updates every 30 s", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        fetch();
+    }
+
+    private long backoffSecondsLeft(Instant now) {
+        if (backoffUntil == null || !now.isBefore(backoffUntil)) return 0;
+        return Math.max(1, (backoffUntil.toEpochMilli() - now.toEpochMilli() + 999) / 1000);
+    }
+
     private void fetch() {
         if (loading) return;
+        // Respect TfL's "try again in N seconds"; a retry is already scheduled.
+        if (backoffSecondsLeft(Instant.now()) > 0) return;
         loading = true;
+        lastFetchStart = Instant.now();
         render();
         final String stopId = prefs.stopId, lineId = prefs.lineId;
         io.execute(() -> {
@@ -196,6 +230,13 @@ public class MainActivity extends Activity {
                 loading = false;
                 lastBoard = board;
                 lastBoardAt = at;
+                if (board.retryAfterSec > 0) {
+                    backoffUntil = at.plusSeconds(board.retryAfterSec);
+                    main.removeCallbacks(retryAfterBackoff);
+                    main.postDelayed(retryAfterBackoff, board.retryAfterSec * 1000L + 500);
+                } else {
+                    backoffUntil = null;
+                }
                 if (failed) {
                     // Keep showing the last good list; say what went wrong.
                     lastError = board.sourceNote;
@@ -218,10 +259,15 @@ public class MainActivity extends Activity {
 
         StringBuilder s = new StringBuilder();
         if (loading) s.append("Updating… ");
-        if (lastError != null) s.append(lastError).append(". ");
+        long wait = backoffSecondsLeft(now);
+        if (wait > 0) {
+            s.append("TfL asked to wait — retrying in ").append(wait).append(" s. ");
+        } else if (lastError != null) {
+            s.append(lastError).append(". ");
+        }
         if (lastUpdated != null) s.append("Updated ").append(HHMMSS.format(lastUpdated));
         else if (!loading && lastError == null) s.append("No data yet");
-        if (lastError == null && !sourceNote.isEmpty()) s.append("\n").append(sourceNote);
+        if (lastError == null && wait == 0 && !sourceNote.isEmpty()) s.append("\n").append(sourceNote);
         status.setText(s.toString().trim());
         renderFilteredSummary();
 
@@ -365,6 +411,11 @@ public class MainActivity extends Activity {
         r.append("Line: ").append(prefs.lineName).append(" (").append(prefs.lineId).append(")\n");
         r.append("Station: ").append(prefs.stopName).append(" (").append(prefs.stopId).append(")\n");
         r.append("Showing: ").append(prefs.directionLabel()).append('\n');
+        r.append("TfL API key: ").append(Tfl.appKey.isEmpty() ? "not set (anonymous, low rate limit)" : "set")
+                .append('\n');
+        if (lastBoard.retryAfterSec > 0) {
+            r.append("Rate limited: TfL asked to wait ").append(lastBoard.retryAfterSec).append(" s\n");
+        }
         if (!lastBoard.sourceNote.isEmpty()) r.append("Note: ").append(lastBoard.sourceNote).append('\n');
 
         for (Tfl.Feed f : lastBoard.feeds) {
@@ -426,7 +477,12 @@ public class MainActivity extends Activity {
         close.setText("Close");
         close.setTextColor(onColour);
         close.setOnClickListener(v -> dialog.dismiss());
+        Button key = new Button(this, null, 0, android.R.style.Widget_Material_Button_Borderless);
+        key.setText("API key");
+        key.setTextColor(onColour);
+        key.setOnClickListener(v -> editApiKey());
         bar.addView(title);
+        bar.addView(key);
         bar.addView(copy);
         bar.addView(close);
         root.addView(bar);
@@ -443,6 +499,27 @@ public class MainActivity extends Activity {
 
         dialog.setContentView(root);
         dialog.show();
+    }
+
+    private void editApiKey() {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setHint("Paste key from api-portal.tfl.gov.uk");
+        input.setText(Tfl.appKey);
+        input.setPadding(dp(20), dp(12), dp(20), dp(12));
+        new AlertDialog.Builder(this)
+                .setTitle("TfL API key")
+                .setMessage("Optional. A free key from api-portal.tfl.gov.uk gives a much higher "
+                        + "rate limit. It's stored only on this phone.")
+                .setView(input)
+                .setPositiveButton("Save", (d, w) -> {
+                    String k = input.getText().toString().trim();
+                    Prefs.saveApiKey(this, k);
+                    Tfl.appKey = k;
+                    Toast.makeText(this, k.isEmpty() ? "Key cleared" : "Key saved", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private static boolean isLight(int c) {

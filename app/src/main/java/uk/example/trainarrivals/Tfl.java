@@ -28,8 +28,20 @@ final class Tfl {
 
     private Tfl() {}
 
-    /** Optional free key from https://api-portal.tfl.gov.uk for higher rate limits. */
-    private static final String APP_KEY = "";
+    /**
+     * Optional free key from https://api-portal.tfl.gov.uk for a much higher
+     * rate limit. Entered in the app and stored only on the phone (see Prefs).
+     */
+    static volatile String appKey = "";
+
+    /** TfL said "too many requests": how long it asked us to wait. */
+    static final class RateLimited extends IOException {
+        final int retryAfterSec;
+        RateLimited(int sec) {
+            super("HTTP 429: TfL rate limit, asked to wait " + sec + " s");
+            retryAfterSec = sec;
+        }
+    }
 
     private static final String BASE = "https://api.tfl.gov.uk";
 
@@ -77,6 +89,8 @@ final class Tfl {
         List<Arrival> trains = new ArrayList<>();
         String sourceNote = "";
         Feed depFeed, arrFeed;
+        /** Seconds TfL asked us to wait before trying again; 0 if not rate limited. */
+        int retryAfterSec = 0;
         /** Every feed requested, in display order. */
         List<Feed> feeds = new ArrayList<>();
     }
@@ -330,7 +344,7 @@ final class Tfl {
         b.feeds.add(b.arrFeed);
 
         if (!hasDepartureBoard(lineId)) {
-            List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed);
+            List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed, b);
             if (arrs != null) b.trains = arrs;
             else b.sourceNote = "Arrivals feed failed: " + b.arrFeed.error;
             return b;
@@ -343,9 +357,17 @@ final class Tfl {
             deps = departures(stopId, lineId, b.depFeed);
         } catch (Exception e) {
             b.depFeed.fail(e);
+            noteRateLimit(b, e);
             deps = null;
         }
-        List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed);
+        List<Arrival> arrs;
+        if (b.retryAfterSec > 0) {
+            // A second request now would only be refused too.
+            b.arrFeed.error = "Skipped: TfL asked to wait";
+            arrs = null;
+        } else {
+            arrs = tryArrivals(stopId, lineId, b.arrFeed, b);
+        }
 
         if (deps == null && arrs == null) {
             b.sourceNote = "Both feeds failed. Board: " + b.depFeed.error
@@ -369,12 +391,19 @@ final class Tfl {
         return b;
     }
 
-    private static List<Arrival> tryArrivals(String stopId, String lineId, Feed f) {
+    private static List<Arrival> tryArrivals(String stopId, String lineId, Feed f, Board b) {
         try {
             return arrivals(stopId, lineId, f);
         } catch (Exception e) {
             f.fail(e);
+            noteRateLimit(b, e);
             return null;
+        }
+    }
+
+    private static void noteRateLimit(Board b, Exception e) {
+        if (e instanceof RateLimited) {
+            b.retryAfterSec = Math.max(b.retryAfterSec, ((RateLimited) e).retryAfterSec);
         }
     }
 
@@ -503,7 +532,10 @@ final class Tfl {
     private static String request(Feed f, String path) throws Exception {
         String url = BASE + path;
         f.url = url;
-        if (!APP_KEY.isEmpty()) url += (url.contains("?") ? "&" : "?") + "app_key=" + APP_KEY;
+        String key = appKey;
+        if (key != null && !key.isEmpty()) {
+            url += (url.contains("?") ? "&" : "?") + "app_key=" + URLEncoder.encode(key, "UTF-8");
+        }
 
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(10_000);
@@ -520,12 +552,27 @@ final class Tfl {
                     // Nothing more to show than the code.
                 }
                 f.bodySnippet = snippet(body);
+                if (code == 429) throw new RateLimited(retryAfter(c, body));
                 throw new IOException("HTTP " + code);
             }
             return readAll(c.getInputStream());
         } finally {
             c.disconnect();
         }
+    }
+
+    /** From the Retry-After header, else "Try again in N seconds" in the body; else 30. */
+    private static int retryAfter(HttpURLConnection c, String body) {
+        try {
+            String h = c.getHeaderField("Retry-After");
+            if (h != null) return Math.max(1, Integer.parseInt(h.trim()));
+        } catch (Exception ignored) {
+            // Fall through to the body.
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?i)try again in (\\d+) second").matcher(body == null ? "" : body);
+        if (m.find()) return Math.max(1, Integer.parseInt(m.group(1)));
+        return 30;
     }
 
     private static String readAll(java.io.InputStream s) throws IOException {
