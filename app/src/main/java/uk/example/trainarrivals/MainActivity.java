@@ -3,6 +3,7 @@ package uk.example.trainarrivals;
 import android.app.Activity;
 import android.content.Intent;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -72,6 +73,7 @@ public class MainActivity extends Activity {
     private List<Tfl.Arrival> trains = new ArrayList<>();
     private Instant lastUpdated;
     private String lastError;
+    private String sourceNote = "";
     private boolean loading;
 
     private final Runnable fetchLoop = new Runnable() {
@@ -155,22 +157,27 @@ public class MainActivity extends Activity {
         final String stopId = prefs.stopId, lineId = prefs.lineId;
         io.execute(() -> {
             List<Tfl.Arrival> result = null;
+            String note = "";
             String error = null;
             try {
+                Tfl.Board board = Tfl.board(stopId, lineId);
                 result = new ArrayList<>();
-                for (Tfl.Arrival a : Tfl.arrivals(stopId, lineId)) {
+                for (Tfl.Arrival a : board.trains) {
                     if (prefs.matches(a)) result.add(a);
                 }
+                note = board.sourceNote;
             } catch (Exception e) {
                 result = null;
                 error = "Couldn't load times (" + e.getClass().getSimpleName() + ")";
             }
             final List<Tfl.Arrival> r = result;
+            final String n = note;
             final String err = error;
             main.post(() -> {
                 loading = false;
                 if (r != null) {
                     trains = r;
+                    sourceNote = n;
                     lastUpdated = Instant.now();
                     lastError = null;
                 } else {
@@ -192,13 +199,14 @@ public class MainActivity extends Activity {
         if (lastError != null) s.append(lastError).append(". ");
         if (lastUpdated != null) s.append("Updated ").append(HHMMSS.format(lastUpdated));
         else if (!loading && lastError == null) s.append("No data yet");
+        if (!sourceNote.isEmpty()) s.append("\n").append(sourceNote);
         status.setText(s.toString().trim());
 
         list.removeAllViews();
 
         List<Tfl.Arrival> upcoming = new ArrayList<>();
         for (Tfl.Arrival t : trains) {
-            if (t.expected.isAfter(now.minusSeconds(30))) upcoming.add(t);
+            if (t.sortTime().isAfter(now.minusSeconds(30))) upcoming.add(t);
         }
 
         if (upcoming.isEmpty() && lastUpdated != null) {
@@ -210,8 +218,11 @@ public class MainActivity extends Activity {
             return;
         }
 
-        for (int i = 0; i < upcoming.size(); i++) {
-            list.addView(row(upcoming.get(i), now, i == 0));
+        boolean highlighted = false;
+        for (Tfl.Arrival t : upcoming) {
+            boolean first = !highlighted && !t.isCancelled();
+            if (first) highlighted = true;
+            list.addView(row(t, now, first));
         }
     }
 
@@ -233,20 +244,52 @@ public class MainActivity extends Activity {
         LinearLayout left = new LinearLayout(this);
         left.setOrientation(LinearLayout.VERTICAL);
         left.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        left.addView(text(HHMM.format(t.expected) + "  " + t.destination, 18, getColor(R.color.text), true));
+
+        boolean cancelled = t.isCancelled();
+        // Timetabled time when known (like station boards); a delay shows on its own line.
+        Instant shownTime = t.scheduled != null ? t.scheduled : t.expected;
+        TextView title = text(HHMM.format(shownTime) + "  " + t.destination, 18,
+                getColor(cancelled ? R.color.muted : R.color.text), true);
+        if (cancelled) {
+            title.setPaintFlags(title.getPaintFlags() | Paint.STRIKE_THRU_TEXT_FLAG);
+        }
+        left.addView(title);
+
+        // Delay line: "Expected 20:35" when it differs from the timetable.
+        if (!cancelled && t.scheduled != null && t.expected != null
+                && Duration.between(t.scheduled, t.expected).getSeconds() >= 60) {
+            left.addView(text("Expected " + HHMM.format(t.expected), 14, getColor(R.color.amber), true));
+        }
 
         StringBuilder sub = new StringBuilder();
         if (!t.platform.isEmpty()) sub.append(t.platform);
-        if (!t.currentLocation.isEmpty()) {
+        if (!cancelled && !t.currentLocation.isEmpty()) {
             if (sub.length() > 0) sub.append(" · ");
             sub.append(t.currentLocation);
         }
+        if (cancelled && !t.cause.isEmpty()) {
+            if (sub.length() > 0) sub.append(" · ");
+            sub.append(t.cause);
+        }
         if (sub.length() > 0) left.addView(text(sub.toString(), 13, getColor(R.color.muted), false));
 
-        long secs = Duration.between(now, t.expected).getSeconds();
-        boolean due = secs < 60;
-        TextView right = text(due ? "Due" : (secs / 60) + " min", first ? 26 : 22,
-                getColor(due ? R.color.amber : R.color.text), true);
+        if (!t.note.isEmpty()) {
+            TextView note = text("⚠ " + t.note, 12, getColor(R.color.note), false);
+            note.setTypeface(Typeface.defaultFromStyle(Typeface.ITALIC));
+            note.setPadding(0, dp(3), 0, 0);
+            left.addView(note);
+        }
+
+        TextView right;
+        if (cancelled) {
+            boolean notStopping = "NotStoppingAtStation".equalsIgnoreCase(t.status);
+            right = text(notStopping ? "Not\nstopping" : "Cancelled", 16, getColor(R.color.red), true);
+        } else {
+            long secs = Duration.between(now, t.expected).getSeconds();
+            boolean due = secs < 60;
+            right = text(due ? "Due" : (secs / 60) + " min", first ? 26 : 22,
+                    getColor(due ? R.color.amber : R.color.text), true);
+        }
         right.setGravity(Gravity.END);
 
         card.addView(left);

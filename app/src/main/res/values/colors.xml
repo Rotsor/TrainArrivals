@@ -7,4 +7,6 @@
     <color name="text">#F2EFF7</color>
     <color name="muted">#A49DB3</color>
     <color name="amber">#FFB547</color>
+    <color name="red">#FF5C5C</color>
+    <color name="note">#C9B7F0</color>
 </resources>

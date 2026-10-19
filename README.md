@@ -17,6 +17,12 @@ The main screen lists the next matching trains with departure time, a
 countdown, platform and current location. It refreshes every 30 seconds while
 open.
 
+For Elizabeth line and Overground stations it uses TfL's departure board
+(`ArrivalDepartures`), which shows cancelled and non-stopping trains (struck
+through in red) and delays (timetabled vs expected time). It also checks TfL's
+arrivals feed, and a small ⚠ note marks any train where the two feeds disagree.
+Tube, DLR and tram stations use the arrivals feed only.
+
 No third-party libraries – just the Android platform.
 
 ## Getting the APK
