@@ -1,7 +1,14 @@
 package uk.example.trainarrivals;
 
 import android.app.Activity;
+import android.app.Dialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
+import android.view.View;
+import android.widget.ScrollView;
+import android.widget.Toast;
+import java.util.LinkedHashMap;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
@@ -75,6 +82,9 @@ public class MainActivity extends Activity {
     private String lastError;
     private String sourceNote = "";
     private boolean loading;
+    private Tfl.Board lastBoard;
+    private Instant lastBoardAt;
+    private TextView filtered;
 
     private final Runnable fetchLoop = new Runnable() {
         @Override public void run() {
@@ -102,6 +112,8 @@ public class MainActivity extends Activity {
         setContentView(R.layout.activity_main);
         list = findViewById(R.id.list);
         status = findViewById(R.id.status);
+        filtered = findViewById(R.id.filtered);
+        filtered.setOnClickListener(v -> showDetails());
         Button refresh = findViewById(R.id.refresh);
         refresh.setOnClickListener(v -> fetch());
         Button change = findViewById(R.id.change);
@@ -156,32 +168,42 @@ public class MainActivity extends Activity {
         render();
         final String stopId = prefs.stopId, lineId = prefs.lineId;
         io.execute(() -> {
-            List<Tfl.Arrival> result = null;
-            String note = "";
-            String error = null;
-            try {
-                Tfl.Board board = Tfl.board(stopId, lineId);
-                result = new ArrayList<>();
-                for (Tfl.Arrival a : board.trains) {
-                    if (prefs.matches(a)) result.add(a);
+            Tfl.Board board = Tfl.board(stopId, lineId);
+
+            // Destination choice is a filter too: record what it hides.
+            Tfl.Feed mine = new Tfl.Feed("Your destination choice");
+            List<Tfl.Arrival> result = new ArrayList<>();
+            for (Tfl.Arrival a : board.trains) {
+                if (prefs.matches(a)) {
+                    result.add(a);
+                } else {
+                    mine.drops.add(new Tfl.Drop("Other destination",
+                            a.destination + " at " + HHMM.format(a.sortTime()), ""));
                 }
-                note = board.sourceNote;
-            } catch (Exception e) {
-                result = null;
-                error = "Couldn't load times (" + e.getClass().getSimpleName() + ")";
             }
-            final List<Tfl.Arrival> r = result;
-            final String n = note;
-            final String err = error;
+            mine.raw = board.trains.size();
+            mine.kept = result.size();
+            if (!mine.drops.isEmpty()) board.feeds.add(mine);
+
+            boolean allFailed = true;
+            for (Tfl.Feed f : board.feeds) {
+                if (f != mine && f.error.isEmpty()) allFailed = false;
+            }
+
+            final boolean failed = allFailed;
+            final Instant at = Instant.now();
             main.post(() -> {
                 loading = false;
-                if (r != null) {
-                    trains = r;
-                    sourceNote = n;
-                    lastUpdated = Instant.now();
-                    lastError = null;
+                lastBoard = board;
+                lastBoardAt = at;
+                if (failed) {
+                    // Keep showing the last good list; say what went wrong.
+                    lastError = board.sourceNote;
                 } else {
-                    lastError = err;
+                    trains = result;
+                    sourceNote = board.sourceNote;
+                    lastUpdated = at;
+                    lastError = null;
                 }
                 render();
             });
@@ -199,8 +221,9 @@ public class MainActivity extends Activity {
         if (lastError != null) s.append(lastError).append(". ");
         if (lastUpdated != null) s.append("Updated ").append(HHMMSS.format(lastUpdated));
         else if (!loading && lastError == null) s.append("No data yet");
-        if (!sourceNote.isEmpty()) s.append("\n").append(sourceNote);
+        if (lastError == null && !sourceNote.isEmpty()) s.append("\n").append(sourceNote);
         status.setText(s.toString().trim());
+        renderFilteredSummary();
 
         list.removeAllViews();
 
@@ -295,6 +318,131 @@ public class MainActivity extends Activity {
         card.addView(left);
         card.addView(right);
         return card;
+    }
+
+    // ------------------------------------------------------------ diagnostics
+
+    /** "12 filtered out: 8 other line · 3 duplicate · 1 other destination  ›" */
+    private void renderFilteredSummary() {
+        if (lastBoard == null) {
+            filtered.setVisibility(View.GONE);
+            return;
+        }
+        Map<String, Integer> byReason = new LinkedHashMap<>();
+        int total = 0;
+        boolean anyError = false;
+        for (Tfl.Feed f : lastBoard.feeds) {
+            if (!f.error.isEmpty()) anyError = true;
+            for (Tfl.Drop d : f.drops) {
+                byReason.merge(d.reason.toLowerCase(Locale.UK), 1, Integer::sum);
+                total++;
+            }
+        }
+        if (total == 0 && !anyError) {
+            filtered.setVisibility(View.GONE);
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        if (total > 0) {
+            sb.append(total).append(" filtered out: ");
+            boolean firstReason = true;
+            for (Map.Entry<String, Integer> e : byReason.entrySet()) {
+                if (!firstReason) sb.append(" · ");
+                sb.append(e.getValue()).append(' ').append(e.getKey());
+                firstReason = false;
+            }
+        } else {
+            sb.append("A request failed");
+        }
+        sb.append("  — details ›");
+        filtered.setText(sb.toString());
+        filtered.setVisibility(View.VISIBLE);
+    }
+
+    private String detailsReport() {
+        StringBuilder r = new StringBuilder();
+        r.append("Fetched ").append(lastBoardAt == null ? "?" : HHMMSS.format(lastBoardAt)).append('\n');
+        r.append("Line: ").append(prefs.lineName).append(" (").append(prefs.lineId).append(")\n");
+        r.append("Station: ").append(prefs.stopName).append(" (").append(prefs.stopId).append(")\n");
+        r.append("Showing: ").append(prefs.directionLabel()).append('\n');
+        if (!lastBoard.sourceNote.isEmpty()) r.append("Note: ").append(lastBoard.sourceNote).append('\n');
+
+        for (Tfl.Feed f : lastBoard.feeds) {
+            r.append("\n━━ ").append(f.name).append(" ━━\n");
+            if (!f.url.isEmpty()) r.append(f.url).append('\n');
+            if (f.httpCode != 0) r.append("HTTP ").append(f.httpCode).append(" · ");
+            r.append("received ").append(f.raw)
+                    .append(" · kept ").append(f.kept)
+                    .append(" · filtered ").append(f.drops.size()).append('\n');
+            if (!f.error.isEmpty()) r.append("ERROR: ").append(f.error).append('\n');
+            if (!f.statuses.isEmpty()) r.append("Statuses: ").append(f.statuses).append('\n');
+            if (!f.bodySnippet.isEmpty()) {
+                r.append("Response started with:\n").append(f.bodySnippet).append('\n');
+            }
+
+            List<Tfl.Drop> drops = new ArrayList<>(f.drops);
+            drops.sort((a, b) -> a.reason.compareTo(b.reason));
+            String lastReason = null;
+            for (Tfl.Drop d : drops) {
+                if (!d.reason.equals(lastReason)) {
+                    r.append("\n").append(d.reason).append(":\n");
+                    lastReason = d.reason;
+                }
+                r.append(" • ").append(d.summary).append('\n');
+                if (!d.json.isEmpty()) r.append("   ").append(d.json).append('\n');
+            }
+        }
+        return r.toString();
+    }
+
+    private void showDetails() {
+        if (lastBoard == null) return;
+        String report = detailsReport();
+
+        Dialog dialog = new Dialog(this, android.R.style.Theme_Material_NoActionBar);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(getColor(R.color.bg));
+        root.setFitsSystemWindows(true);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setBackgroundColor(lineColour);
+        bar.setPadding(dp(16), dp(8), dp(4), dp(8));
+        int onColour = isLight(lineColour) ? 0xFF111111 : 0xFFFFFFFF;
+        TextView title = text("Feed details", 18, onColour, true);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        Button copy = new Button(this, null, 0, android.R.style.Widget_Material_Button_Borderless);
+        copy.setText("Copy");
+        copy.setTextColor(onColour);
+        copy.setOnClickListener(v -> {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(ClipData.newPlainText("Train feed details", report));
+            Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+        });
+        Button close = new Button(this, null, 0, android.R.style.Widget_Material_Button_Borderless);
+        close.setText("Close");
+        close.setTextColor(onColour);
+        close.setOnClickListener(v -> dialog.dismiss());
+        bar.addView(title);
+        bar.addView(copy);
+        bar.addView(close);
+        root.addView(bar);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        TextView body = text(report, 12, getColor(R.color.text), false);
+        body.setTypeface(Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);
+        body.setPadding(dp(12), dp(12), dp(12), dp(24));
+        scroll.addView(body);
+        root.addView(scroll);
+
+        dialog.setContentView(root);
+        dialog.show();
     }
 
     private static boolean isLight(int c) {

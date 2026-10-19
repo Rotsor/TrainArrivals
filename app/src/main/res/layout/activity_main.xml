@@ -89,6 +89,22 @@
             android:textColor="@color/amber" />
     </LinearLayout>
 
+    <!-- "N filtered out … details ›" (tap for the full-screen breakdown) -->
+    <TextView
+        android:id="@+id/filtered"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:clickable="true"
+        android:focusable="true"
+        android:paddingStart="20dp"
+        android:paddingTop="2dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="8dp"
+        android:textColor="@color/note"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"

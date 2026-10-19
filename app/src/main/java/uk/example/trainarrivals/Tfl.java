@@ -76,7 +76,48 @@ final class Tfl {
     static final class Board {
         List<Arrival> trains = new ArrayList<>();
         String sourceNote = "";
+        Feed depFeed, arrFeed;
+        /** Every feed requested, in display order. */
+        List<Feed> feeds = new ArrayList<>();
     }
+
+    /** One entry the app received but did not show, and why. */
+    static final class Drop {
+        final String reason, summary, json;
+        Drop(String reason, String summary, String json) {
+            this.reason = reason; this.summary = summary; this.json = json;
+        }
+    }
+
+    /** What happened on one request: for the diagnostics screen. */
+    static final class Feed {
+        final String name;
+        String url = "";
+        int httpCode = 0;
+        String error = "";
+        /** Start of the response body, kept when it couldn't be used. */
+        String bodySnippet = "";
+        int raw = 0, kept = 0;
+        final List<Drop> drops = new ArrayList<>();
+        /** departureStatus values seen on kept trains, with counts. */
+        final Map<String, Integer> statuses = new LinkedHashMap<>();
+
+        Feed(String name) { this.name = name; }
+
+        void drop(String reason, String summary, JSONObject o) {
+            String json = o == null ? "" : o.toString();
+            if (json.length() > 600) json = json.substring(0, 600) + "…";
+            drops.add(new Drop(reason, summary, json));
+        }
+
+        void fail(Exception e) {
+            String m = e.getMessage();
+            error = e.getClass().getSimpleName() + (m == null || m.isEmpty() ? "" : ": " + m);
+        }
+    }
+
+    private static final DateTimeFormatter HHMM =
+            DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.of("Europe/London"));
 
     /**
      * National-Rail-style lines, for which TfL's departure board
@@ -173,25 +214,39 @@ final class Tfl {
     }
 
     static List<Arrival> arrivals(String stopId, String lineId) throws Exception {
-        JSONArray arr = new JSONArray(get("/StopPoint/" + enc(stopId) + "/Arrivals"));
+        return arrivals(stopId, lineId, new Feed("Arrivals feed"));
+    }
+
+    static List<Arrival> arrivals(String stopId, String lineId, Feed f) throws Exception {
+        JSONArray arr = fetchArray(f, "/StopPoint/" + enc(stopId) + "/Arrivals");
         List<Arrival> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
-            if (o == null) continue;
-            if (!lineId.equalsIgnoreCase(o.optString("lineId"))) continue;
+            if (o == null) {
+                f.drop("Not a JSON object", String.valueOf(arr.opt(i)), null);
+                continue;
+            }
+            String line = o.optString("lineId");
+            if (!lineId.equalsIgnoreCase(line)) {
+                f.drop("Other line", line + " → " + o.optString("destinationName"), o);
+                continue;
+            }
 
-            Instant when;
-            try {
-                when = Instant.parse(o.optString("expectedArrival"));
-            } catch (Exception e) {
+            String rawTime = o.optString("expectedArrival");
+            Instant when = parseTime(rawTime);
+            if (when == null) {
+                f.drop("Unreadable time", "expectedArrival = \"" + rawTime + "\"", o);
                 continue;
             }
 
             // TfL sometimes lists the same train twice; dedupe to the minute.
             String dest = cleanName(o.optString("destinationName", ""));
             String key = (when.getEpochSecond() / 60) + "|" + norm(dest);
-            if (!seen.add(key)) continue;
+            if (!seen.add(key)) {
+                f.drop("Duplicate", dest + " at " + HHMM.format(when), o);
+                continue;
+            }
 
             Arrival a = new Arrival();
             a.expected = when;
@@ -204,26 +259,44 @@ final class Tfl {
             out.add(a);
         }
         out.sort((a, b) -> a.expected.compareTo(b.expected));
+        f.kept = out.size();
         return out;
     }
 
     /** TfL's departure board for rail lines: includes status and timetabled times. */
-    static List<Arrival> departures(String stopId, String lineId) throws Exception {
-        JSONArray arr = new JSONArray(get("/StopPoint/" + enc(stopId)
-                + "/ArrivalDepartures?lineIds=" + enc(lineId)));
+    static List<Arrival> departures(String stopId, String lineId, Feed f) throws Exception {
+        JSONArray arr = fetchArray(f, "/StopPoint/" + enc(stopId)
+                + "/ArrivalDepartures?lineIds=" + enc(lineId));
         List<Arrival> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
-            if (o == null) continue;
+            if (o == null) {
+                f.drop("Not a JSON object", String.valueOf(arr.opt(i)), null);
+                continue;
+            }
 
-            Instant sched = parseTime(o.optString("scheduledTimeOfDeparture"));
-            Instant est = parseTime(o.optString("estimatedTimeOfDeparture"));
-            if (sched == null && est == null) continue; // terminates here: no departure
+            String rawSched = str(o, "scheduledTimeOfDeparture");
+            String rawEst = str(o, "estimatedTimeOfDeparture");
+            Instant sched = parseTime(rawSched);
+            Instant est = parseTime(rawEst);
+            if (sched == null && est == null) {
+                if (rawSched.isEmpty() && rawEst.isEmpty()) {
+                    f.drop("No departure time (terminates here?)",
+                            o.optString("destinationName"), o);
+                } else {
+                    f.drop("Unreadable time", "scheduled = \"" + rawSched
+                            + "\", estimated = \"" + rawEst + "\"", o);
+                }
+                continue;
+            }
 
             String dest = cleanName(o.optString("destinationName", ""));
             Instant key = sched != null ? sched : est;
-            if (!seen.add(key.getEpochSecond() / 60 + "|" + norm(dest))) continue;
+            if (!seen.add(key.getEpochSecond() / 60 + "|" + norm(dest))) {
+                f.drop("Duplicate", dest + " at " + HHMM.format(key), o);
+                continue;
+            }
 
             Arrival a = new Arrival();
             a.lineId = lineId;
@@ -233,10 +306,12 @@ final class Tfl {
             a.destinationId = str(o, "destinationNaptanId");
             a.platform = cleanPlatform(o.optString("platformName", ""));
             a.status = str(o, "departureStatus");
+            f.statuses.merge(a.status.isEmpty() ? "(none)" : a.status, 1, Integer::sum);
             a.cause = str(o, "cause");
             out.add(a);
         }
         out.sort((x, y) -> x.sortTime().compareTo(y.sortTime()));
+        f.kept = out.size();
         return out;
     }
 
@@ -245,43 +320,62 @@ final class Tfl {
      * board, cross-checked against the arrivals feed, with a note on each
      * train where the two disagree. For Tube/DLR/tram it is the arrivals feed.
      */
-    static Board board(String stopId, String lineId) throws Exception {
+    /**
+     * Never throws: failures are recorded on the feeds and summarised in
+     * sourceNote, so the screen can always say what happened.
+     */
+    static Board board(String stopId, String lineId) {
         Board b = new Board();
+        b.arrFeed = new Feed("Arrivals feed");
+        b.feeds.add(b.arrFeed);
+
         if (!hasDepartureBoard(lineId)) {
-            b.trains = arrivals(stopId, lineId);
+            List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed);
+            if (arrs != null) b.trains = arrs;
+            else b.sourceNote = "Arrivals feed failed: " + b.arrFeed.error;
             return b;
         }
 
+        b.depFeed = new Feed("Departure board");
+        b.feeds.add(0, b.depFeed);
         List<Arrival> deps;
         try {
-            deps = departures(stopId, lineId);
+            deps = departures(stopId, lineId, b.depFeed);
         } catch (Exception e) {
-            b.trains = arrivals(stopId, lineId);
-            b.sourceNote = "Departure board unavailable, so cancellations aren't shown";
-            return b;
+            b.depFeed.fail(e);
+            deps = null;
         }
+        List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed);
 
-        List<Arrival> arrs;
-        try {
-            arrs = arrivals(stopId, lineId);
-        } catch (Exception e) {
-            arrs = null;
-        }
-
-        b.trains = deps;
-        if (arrs == null) {
-            b.sourceNote = "Couldn't cross-check with the arrivals feed";
-            return b;
-        }
-        if (deps.isEmpty() && !arrs.isEmpty()) {
+        if (deps == null && arrs == null) {
+            b.sourceNote = "Both feeds failed. Board: " + b.depFeed.error
+                    + ". Arrivals: " + b.arrFeed.error;
+        } else if (deps == null) {
+            b.trains = arrs;
+            b.sourceNote = "Departure board failed (" + b.depFeed.error
+                    + "), so cancellations aren't shown";
+        } else if (arrs == null) {
+            b.trains = deps;
+            b.sourceNote = "Arrivals feed failed (" + b.arrFeed.error + "), so no cross-check";
+        } else if (deps.isEmpty() && !arrs.isEmpty()) {
             b.trains = arrs;
             for (Arrival a : arrs) a.note = "Only in the arrivals feed";
-            b.sourceNote = "Departure board is empty; showing the arrivals feed";
-            return b;
+            b.sourceNote = "Departure board had no usable trains (TfL sent "
+                    + b.depFeed.raw + "); showing the arrivals feed";
+        } else {
+            b.trains = deps;
+            crossCheck(deps, arrs);
         }
-
-        crossCheck(deps, arrs);
         return b;
+    }
+
+    private static List<Arrival> tryArrivals(String stopId, String lineId, Feed f) {
+        try {
+            return arrivals(stopId, lineId, f);
+        } catch (Exception e) {
+            f.fail(e);
+            return null;
+        }
     }
 
     /** Pair up the same train in both feeds, then note any disagreement. */
@@ -388,7 +482,27 @@ final class Tfl {
     }
 
     private static String get(String path) throws Exception {
+        Feed f = new Feed("request");
+        return request(f, path);
+    }
+
+    /** Fetches a JSON list, recording status, size and any failure on the feed. */
+    private static JSONArray fetchArray(Feed f, String path) throws Exception {
+        String body = request(f, path);
+        JSONArray arr;
+        try {
+            arr = new JSONArray(body);
+        } catch (Exception e) {
+            f.bodySnippet = snippet(body);
+            throw new IOException("Response wasn't a list of trains");
+        }
+        f.raw = arr.length();
+        return arr;
+    }
+
+    private static String request(Feed f, String path) throws Exception {
         String url = BASE + path;
+        f.url = url;
         if (!APP_KEY.isEmpty()) url += (url.contains("?") ? "&" : "?") + "app_key=" + APP_KEY;
 
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
@@ -397,16 +511,36 @@ final class Tfl {
         c.setRequestProperty("Accept", "application/json");
         try {
             int code = c.getResponseCode();
-            if (code != 200) throw new IOException("HTTP " + code);
-            StringBuilder sb = new StringBuilder();
-            try (BufferedReader in = new BufferedReader(
-                    new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = in.readLine()) != null) sb.append(line);
+            f.httpCode = code;
+            if (code != 200) {
+                String body = "";
+                try {
+                    body = readAll(c.getErrorStream());
+                } catch (Exception ignored) {
+                    // Nothing more to show than the code.
+                }
+                f.bodySnippet = snippet(body);
+                throw new IOException("HTTP " + code);
             }
-            return sb.toString();
+            return readAll(c.getInputStream());
         } finally {
             c.disconnect();
         }
+    }
+
+    private static String readAll(java.io.InputStream s) throws IOException {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(s, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = in.readLine()) != null) sb.append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static String snippet(String s) {
+        if (s == null) return "";
+        s = s.trim();
+        return s.length() > 800 ? s.substring(0, 800) + "…" : s;
     }
 }
