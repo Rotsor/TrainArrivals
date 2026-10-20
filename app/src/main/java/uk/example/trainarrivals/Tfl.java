@@ -264,6 +264,11 @@ final class Tfl {
 
     static List<Arrival> arrivals(String stopId, String lineId, Feed f) throws Exception {
         JSONArray arr = fetchArray(f, "/StopPoint/" + enc(stopId) + "/Arrivals");
+        return parseArrivals(arr, lineId, f);
+    }
+
+    /** Separate from the request so it can be tested with saved responses. */
+    static List<Arrival> parseArrivals(JSONArray arr, String lineId, Feed f) {
         List<Arrival> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (int i = 0; i < arr.length(); i++) {
@@ -285,8 +290,22 @@ final class Tfl {
                 continue;
             }
 
-            // TfL sometimes lists the same train twice; dedupe to the minute.
             String dest = cleanName(o.optString("destinationName", ""));
+
+            // Trains ending their journey here never depart, so they aren't
+            // departures. The departure board leaves them out too.
+            String here = str(o, "naptanId"), destId = str(o, "destinationNaptanId");
+            String stationName = str(o, "stationName");
+            boolean terminates = (!destId.isEmpty() && destId.equalsIgnoreCase(here))
+                    || (!dest.isEmpty() && !stationName.isEmpty() && norm(dest).equals(norm(stationName)));
+            if (terminates) {
+                String plat = cleanPlatform(o.optString("platformName", ""));
+                f.drop("Terminates here", dest + (plat.isEmpty() ? "" : ", " + plat)
+                        + " at " + HHMM.format(when), o);
+                continue;
+            }
+
+            // TfL sometimes lists the same train twice; dedupe to the minute.
             String key = (when.getEpochSecond() / 60) + "|" + norm(dest);
             if (!seen.add(key)) {
                 f.drop("Duplicate", dest + " at " + HHMM.format(when), o);
@@ -777,8 +796,16 @@ final class Tfl {
                 .trim();
     }
 
+    /**
+     * For comparing station names across feeds: case, punctuation and suffixes
+     * like "Rail Station" ignored, and a leading "London " dropped, because
+     * TfL and National Rail disagree on it ("Liverpool Street" vs
+     * "London Liverpool Street").
+     */
     static String norm(String s) {
-        return cleanName(s).toLowerCase(Locale.UK).replaceAll("[^a-z0-9]", "");
+        String c = cleanName(s).toLowerCase(Locale.UK).trim();
+        if (c.startsWith("london ")) c = c.substring(7);
+        return c.replaceAll("[^a-z0-9]", "");
     }
 
     /** "Eastbound - Platform A" → "eastbound"; "" if no direction is named. */
