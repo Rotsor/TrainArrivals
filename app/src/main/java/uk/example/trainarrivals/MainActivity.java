@@ -454,7 +454,7 @@ public class MainActivity extends Activity {
             right = text(notStopping ? "Not\nstopping" : "Cancelled", 16, getColor(R.color.red), true);
         } else {
             right = text(countdown(t, now), first ? 26 : 22,
-                    getColor(isDue(t, now) ? R.color.amber : R.color.text), true);
+                    getColor(isSoon(t, now) ? R.color.amber : R.color.text), true);
         }
         right.setGravity(Gravity.END);
 
@@ -608,17 +608,22 @@ public class MainActivity extends Activity {
         dialog.show();
     }
 
-    /** Seconds-precise trains count down "1:45" under 10 min; others "N min". */
+    /**
+     * Seconds-precise trains count down "1:45" all the way to 0:01 (then "Due");
+     * minute-precise trains show "N min", and "Due" under a minute.
+     */
     static String countdown(Tfl.Arrival t, Instant now) {
         long secs = Duration.between(now, t.expected).getSeconds();
-        if (isDue(t, now)) return "Due";
-        if (t.secondsPrecise && secs < 600) {
-            return (secs / 60) + ":" + String.format(Locale.UK, "%02d", secs % 60);
+        if (t.secondsPrecise) {
+            if (secs <= 0) return "Due";
+            if (secs < 600) return (secs / 60) + ":" + String.format(Locale.UK, "%02d", secs % 60);
+            return (secs / 60) + " min";
         }
-        return (secs / 60) + " min";
+        return secs < 60 ? "Due" : (secs / 60) + " min";
     }
 
-    static boolean isDue(Tfl.Arrival t, Instant now) {
+    /** Amber highlight for the last 30 s (or last minute without seconds). */
+    static boolean isSoon(Tfl.Arrival t, Instant now) {
         long secs = Duration.between(now, t.expected).getSeconds();
         return secs < (t.secondsPrecise ? 30 : 60);
     }
