@@ -85,7 +85,7 @@ final class PlatformBook {
     }
 
     /**
-     * "Plat A — eastbound: Abbey Wood, Shenfield" style label. Uses the
+     * "Plat 2 — westbound: Ealing Broadway, West Ruislip" style label. Uses the
      * train's own direction if it has one, else what's known for the platform.
      */
     String label(String platform, String trainDir) {
