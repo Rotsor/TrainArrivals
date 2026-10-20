@@ -87,7 +87,6 @@ public class MainActivity extends Activity {
     private Tfl.Board lastBoard;
     private Instant lastBoardAt;
     private final VehicleCheck vehicleCheck = new VehicleCheck();
-    private PlatformBook platformBook = new PlatformBook();
     private TextView filtered;
     /** Until when TfL asked us not to call (HTTP 429). */
     private Instant backoffUntil;
@@ -120,7 +119,8 @@ public class MainActivity extends Activity {
         }
 
         setContentView(R.layout.activity_main);
-        platformBook = PlatformBook.load(this, prefs.stopId);
+        // Earlier versions saved per-platform destination lists; no longer used.
+        getSharedPreferences("platforms", MODE_PRIVATE).edit().clear().apply();
         list = findViewById(R.id.list);
         status = findViewById(R.id.status);
         filtered = findViewById(R.id.filtered);
@@ -319,8 +319,6 @@ public class MainActivity extends Activity {
                 lastBoard = board;
                 lastBoardAt = at;
                 vehicleCheck.update(board.arrivals, at);
-                platformBook.merge(board);
-                platformBook.save(this, prefs.stopId);
                 if (board.retryAfterSec > 0) {
                     backoffUntil = at.plusSeconds(board.retryAfterSec);
                     main.removeCallbacks(retryAfterBackoff);
@@ -428,7 +426,10 @@ public class MainActivity extends Activity {
         }
 
         StringBuilder sub = new StringBuilder();
-        if (!t.platform.isEmpty()) sub.append(platformBook.label(t.platform, t.platformDir));
+        if (!t.platform.isEmpty()) {
+            sub.append(t.platform);
+            if (!t.platformDir.isEmpty()) sub.append(" · ").append(t.platformDir);
+        }
         if (!cancelled && !t.currentLocation.isEmpty()) {
             if (sub.length() > 0) sub.append(" · ");
             sub.append(t.currentLocation);

@@ -20,11 +20,6 @@ pick again.
 setup. Starred setups appear as chips in that row: tap one to switch,
 long-press to remove it.
 
-**Platform labels:** platforms are labelled with their direction (when TfL
-names it) and the destinations of trains seen there, e.g.
-"Plat A — eastbound: …". The app learns these as it runs and keeps them on the
-phone.
-
 The main screen lists the next matching trains with departure time, a
 countdown, platform and current location. It refreshes every 30 seconds while
 open.

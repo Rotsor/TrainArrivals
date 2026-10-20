@@ -117,20 +117,7 @@ final class Tfl {
         Feed depFeed, arrFeed, nrFeed;
         /** The arrivals feed's trains for this line (all destinations); null if it failed. */
         List<Arrival> arrivals;
-        /** Platform label → destinations seen there (with counts) this refresh, all feeds. */
-        final Map<String, Map<String, Integer>> platformDests = new LinkedHashMap<>();
-        /** Platform label → direction, when a feed names it. */
-        final Map<String, String> platformDirs = new HashMap<>();
 
-        void recordPlatforms(List<Arrival> trains) {
-            if (trains == null) return;
-            for (Arrival a : trains) {
-                if (a.platform.isEmpty() || a.destination.isEmpty()) continue;
-                platformDests.computeIfAbsent(a.platform, k -> new LinkedHashMap<>())
-                        .merge(a.destination, 1, Integer::sum);
-                if (!a.platformDir.isEmpty()) platformDirs.put(a.platform, a.platformDir);
-            }
-        }
         /** Seconds TfL asked us to wait before trying again; 0 if not rate limited. */
         int retryAfterSec = 0;
         /** Every feed requested, in display order. */
@@ -398,7 +385,6 @@ final class Tfl {
         if (!hasDepartureBoard(lineId)) {
             List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed, b);
             b.arrivals = arrs == null ? null : new ArrayList<>(arrs);
-            b.recordPlatforms(arrs);
             if (arrs != null) b.trains = arrs;
             else b.sourceNote = "Arrivals feed failed: " + b.arrFeed.error;
             return b;
@@ -438,10 +424,6 @@ final class Tfl {
                 b.nrFeed.fail(e);
             }
         }
-
-        b.recordPlatforms(deps);
-        b.recordPlatforms(arrs);
-        b.recordPlatforms(nr);
 
         List<String> notes = new ArrayList<>();
         if (deps == null) notes.add("TfL departure board failed (" + b.depFeed.error + ")");
