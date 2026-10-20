@@ -799,8 +799,8 @@ final class Tfl {
     /**
      * For comparing station names across feeds: case, punctuation and suffixes
      * like "Rail Station" ignored, and a leading "London " dropped, because
-     * TfL and National Rail disagree on it ("Liverpool Street" vs
-     * "London Liverpool Street").
+     * TfL and National Rail disagree on it ("Paddington" vs
+     * "London Paddington").
      */
     static String norm(String s) {
         String c = cleanName(s).toLowerCase(Locale.UK).trim();
