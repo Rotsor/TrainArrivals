@@ -86,6 +86,7 @@ public class MainActivity extends Activity {
     private boolean loading;
     private Tfl.Board lastBoard;
     private Instant lastBoardAt;
+    private final VehicleCheck vehicleCheck = new VehicleCheck();
     private TextView filtered;
     /** Until when TfL asked us not to call (HTTP 429). */
     private Instant backoffUntil;
@@ -231,6 +232,7 @@ public class MainActivity extends Activity {
                 loading = false;
                 lastBoard = board;
                 lastBoardAt = at;
+                vehicleCheck.update(board.arrivals, at);
                 if (board.retryAfterSec > 0) {
                     backoffUntil = at.plusSeconds(board.retryAfterSec);
                     main.removeCallbacks(retryAfterBackoff);
@@ -453,6 +455,7 @@ public class MainActivity extends Activity {
                 if (!d.json.isEmpty()) r.append("   ").append(d.json).append('\n');
             }
         }
+        r.append("\n━━ vehicleId check ━━\n").append(vehicleCheck.report());
         return r.toString();
     }
 

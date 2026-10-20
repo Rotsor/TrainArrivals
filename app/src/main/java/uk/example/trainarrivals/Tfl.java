@@ -82,6 +82,8 @@ final class Tfl {
         String destination = "";
         String destinationId = "";
         String currentLocation = "";
+        /** TfL arrivals feed's vehicleId; "" if none. Being checked for stability. */
+        String vehicleId = "";
         /** "", OnTime, Delayed, Cancelled or NotStoppingAtStation. */
         String status = "";
         String cause = "";
@@ -110,6 +112,8 @@ final class Tfl {
         List<Arrival> trains = new ArrayList<>();
         String sourceNote = "";
         Feed depFeed, arrFeed, nrFeed;
+        /** The arrivals feed's trains for this line (all destinations); null if it failed. */
+        List<Arrival> arrivals;
         /** Seconds TfL asked us to wait before trying again; 0 if not rate limited. */
         int retryAfterSec = 0;
         /** Every feed requested, in display order. */
@@ -293,6 +297,7 @@ final class Tfl {
             a.destinationId = o.optString("destinationNaptanId", "");
             String loc = o.optString("currentLocation", "");
             a.currentLocation = "null".equals(loc) ? "" : loc;
+            a.vehicleId = str(o, "vehicleId").trim();
             out.add(a);
         }
         out.sort((a, b) -> a.expected.compareTo(b.expected));
@@ -368,6 +373,7 @@ final class Tfl {
 
         if (!hasDepartureBoard(lineId)) {
             List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed, b);
+            b.arrivals = arrs == null ? null : new ArrayList<>(arrs);
             if (arrs != null) b.trains = arrs;
             else b.sourceNote = "Arrivals feed failed: " + b.arrFeed.error;
             return b;
@@ -392,6 +398,7 @@ final class Tfl {
             arrs = null;
         } else {
             arrs = tryArrivals(stopId, lineId, b.arrFeed, b);
+            b.arrivals = arrs == null ? null : new ArrayList<>(arrs);
         }
 
         // 3. National Rail, if the user set it up. Its own rate limit doesn't pause TfL.
@@ -501,6 +508,7 @@ final class Tfl {
             used[best] = true;
             Arrival a = arrs.get(best);
             if (d.currentLocation.isEmpty()) d.currentLocation = a.currentLocation;
+            if (d.vehicleId.isEmpty()) d.vehicleId = a.vehicleId;
 
             if (d.isCancelled()) {
                 d.addNote("Arrivals feed still shows it, due " + hhmm.format(a.expected));
