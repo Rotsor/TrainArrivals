@@ -38,7 +38,8 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
 
     private static final long FETCH_EVERY_MS = 30_000;
-    private static final long TICK_EVERY_MS = 5_000;
+    /** Redraw rate: every second, so second-level countdowns tick smoothly. */
+    private static final long TICK_EVERY_MS = 1_000;
     /** Minimum gap between manual refreshes: each one is two TfL requests. */
     private static final long MIN_MANUAL_GAP_MS = 10_000;
 
@@ -452,10 +453,8 @@ public class MainActivity extends Activity {
             boolean notStopping = "NotStoppingAtStation".equalsIgnoreCase(t.status);
             right = text(notStopping ? "Not\nstopping" : "Cancelled", 16, getColor(R.color.red), true);
         } else {
-            long secs = Duration.between(now, t.expected).getSeconds();
-            boolean due = secs < 60;
-            right = text(due ? "Due" : (secs / 60) + " min", first ? 26 : 22,
-                    getColor(due ? R.color.amber : R.color.text), true);
+            right = text(countdown(t, now), first ? 26 : 22,
+                    getColor(isDue(t, now) ? R.color.amber : R.color.text), true);
         }
         right.setGravity(Gravity.END);
 
@@ -527,6 +526,12 @@ public class MainActivity extends Activity {
                     .append(" · filtered ").append(f.drops.size()).append('\n');
             if (!f.error.isEmpty()) r.append("ERROR: ").append(f.error).append('\n');
             if (!f.statuses.isEmpty()) r.append("Statuses: ").append(f.statuses).append('\n');
+            if (f.kept > 0) {
+                r.append("Times with non-zero seconds: ").append(f.withSeconds).append(" of ")
+                        .append(f.kept).append(f.withSeconds > 0 ? " (seconds shown)" : " (minutes only)")
+                        .append('\n');
+            }
+            if (!f.sample.isEmpty()) r.append("Sample entry:\n   ").append(f.sample).append('\n');
             for (String m : f.messages) r.append("Message: ").append(m).append('\n');
             if (!f.bodySnippet.isEmpty()) {
                 r.append("Response started with:\n").append(f.bodySnippet).append('\n');
@@ -601,6 +606,21 @@ public class MainActivity extends Activity {
 
         dialog.setContentView(root);
         dialog.show();
+    }
+
+    /** Seconds-precise trains count down "1:45" under 10 min; others "N min". */
+    static String countdown(Tfl.Arrival t, Instant now) {
+        long secs = Duration.between(now, t.expected).getSeconds();
+        if (isDue(t, now)) return "Due";
+        if (t.secondsPrecise && secs < 600) {
+            return (secs / 60) + ":" + String.format(Locale.UK, "%02d", secs % 60);
+        }
+        return (secs / 60) + " min";
+    }
+
+    static boolean isDue(Tfl.Arrival t, Instant now) {
+        long secs = Duration.between(now, t.expected).getSeconds();
+        return secs < (t.secondsPrecise ? 30 : 60);
     }
 
     private static boolean isLight(int c) {

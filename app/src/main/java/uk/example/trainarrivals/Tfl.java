@@ -94,6 +94,8 @@ final class Tfl {
         String note = "";
         /** True when the expected time isn't known (National Rail just says "Delayed"). */
         boolean expectedUnknown = false;
+        /** True when the expected time comes from a feed that gives seconds. */
+        boolean secondsPrecise = false;
 
         void addNote(String n) {
             note = note.isEmpty() ? n : note + "\n" + n;
@@ -141,6 +143,16 @@ final class Tfl {
         /** Start of the response body, kept when it couldn't be used. */
         String bodySnippet = "";
         int raw = 0, kept = 0;
+        /** Kept entries whose time has non-zero seconds: shows the feed's real precision. */
+        int withSeconds = 0;
+        /** First kept entry, raw, for the details report. */
+        String sample = "";
+
+        void sampleOf(JSONObject o) {
+            if (!sample.isEmpty() || o == null) return;
+            String s = o.toString();
+            sample = s.length() > 1200 ? s.substring(0, 1200) + "…" : s;
+        }
         final List<Drop> drops = new ArrayList<>();
         /** Service messages (National Rail disruption notices). */
         final List<String> messages = new ArrayList<>();
@@ -322,6 +334,10 @@ final class Tfl {
             String loc = o.optString("currentLocation", "");
             a.currentLocation = "null".equals(loc) ? "" : loc;
             a.vehicleId = str(o, "vehicleId").trim();
+            // The arrivals feed predicts to the second (expectedArrival, timeToStation).
+            a.secondsPrecise = true;
+            if (when.getEpochSecond() % 60 != 0) f.withSeconds++;
+            f.sampleOf(o);
             out.add(a);
         }
         out.sort((a, b) -> a.expected.compareTo(b.expected));
@@ -380,9 +396,16 @@ final class Tfl {
             a.status = str(o, "departureStatus");
             f.statuses.merge(a.status.isEmpty() ? "(none)" : a.status, 1, Integer::sum);
             a.cause = str(o, "cause");
+            if ((est != null && est.getEpochSecond() % 60 != 0)
+                    || (sched != null && sched.getEpochSecond() % 60 != 0)) {
+                f.withSeconds++;
+            }
+            f.sampleOf(o);
             out.add(a);
         }
         out.sort((x, y) -> x.sortTime().compareTo(y.sortTime()));
+        // Seconds are only meaningful if this feed actually uses them.
+        if (f.withSeconds > 0) for (Arrival a : out) a.secondsPrecise = true;
         f.kept = out.size();
         return out;
     }
@@ -635,6 +658,7 @@ final class Tfl {
                 a.status = "OnTime";
             }
             f.statuses.merge(etd.isEmpty() ? "(none)" : (est != null ? "HH:mm" : etd), 1, Integer::sum);
+            f.sampleOf(o); // National Rail gives minutes only ("HH:mm")
             out.add(a);
         }
         out.sort((x, y) -> x.sortTime().compareTo(y.sortTime()));
