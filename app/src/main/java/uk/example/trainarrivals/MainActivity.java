@@ -87,6 +87,7 @@ public class MainActivity extends Activity {
     private Tfl.Board lastBoard;
     private Instant lastBoardAt;
     private final VehicleCheck vehicleCheck = new VehicleCheck();
+    private PlatformBook platformBook = new PlatformBook();
     private TextView filtered;
     /** Until when TfL asked us not to call (HTTP 429). */
     private Instant backoffUntil;
@@ -119,6 +120,7 @@ public class MainActivity extends Activity {
         }
 
         setContentView(R.layout.activity_main);
+        platformBook = PlatformBook.load(this, prefs.stopId);
         list = findViewById(R.id.list);
         status = findViewById(R.id.status);
         filtered = findViewById(R.id.filtered);
@@ -143,6 +145,61 @@ public class MainActivity extends Activity {
             tv.setTextColor(onColour);
         }
         getWindow().setStatusBarColor(lineColour);
+        renderStars();
+    }
+
+    // --------------------------------------------------------------- starred
+
+    /** Row under the header: a star toggle for this setup, then a chip per starred setup. */
+    private void renderStars() {
+        LinearLayout row = findViewById(R.id.stars);
+        row.removeAllViews();
+        List<Prefs> starred = Prefs.loadStarred(this);
+        boolean isStarred = false;
+        for (Prefs p : starred) if (p.key().equals(prefs.key())) isStarred = true;
+
+        TextView toggle = chip(isStarred ? "★ Starred" : "☆ Star this", false);
+        toggle.setTextColor(getColor(R.color.amber));
+        toggle.setOnClickListener(v -> {
+            boolean now = Prefs.toggleStar(this, prefs);
+            Toast.makeText(this, now ? "Starred — tap a chip to switch" : "Removed from starred",
+                    Toast.LENGTH_SHORT).show();
+            renderStars();
+        });
+        row.addView(toggle);
+
+        for (Prefs p : starred) {
+            boolean current = p.key().equals(prefs.key());
+            TextView c = chip(p.chipLabel(), current);
+            c.setOnClickListener(v -> {
+                if (current) return;
+                p.save(this);
+                recreate();
+            });
+            c.setOnLongClickListener(v -> {
+                Prefs.toggleStar(this, p);
+                Toast.makeText(this, "Removed " + p.chipLabel() + " from starred", Toast.LENGTH_SHORT).show();
+                renderStars();
+                return true;
+            });
+            row.addView(c);
+        }
+    }
+
+    private TextView chip(String label, boolean current) {
+        TextView c = text(label, 13, getColor(current ? R.color.text : R.color.muted), current);
+        c.setPadding(dp(12), dp(6), dp(12), dp(6));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(getColor(R.color.card));
+        bg.setCornerRadius(dp(16));
+        bg.setStroke(dp(current ? 2 : 1), current
+                ? (lineColour == 0xFF000000 ? 0xFF888888 : lineColour) : 0xFF3A3445);
+        c.setBackground(bg);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, dp(8), 0);
+        c.setLayoutParams(lp);
+        return c;
     }
 
     private void openSetup() {
@@ -206,15 +263,44 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             Tfl.Board board = Tfl.board(stopId, lineId);
 
-            // Destination choice is a filter too: record what it hides.
-            Tfl.Feed mine = new Tfl.Feed("Your destination choice");
+            // "Calling at" needs the line's stopping patterns (cached for a day).
+            boolean calling = prefs.isCallingMode() && !prefs.callNames.isEmpty();
+            Routes routes = null;
+            Tfl.Feed routeFeed = new Tfl.Feed("TfL route map (for \"calling at\")");
+            if (calling) {
+                try {
+                    routes = Routes.get(this, lineId, routeFeed, board.retryAfterSec == 0);
+                } catch (Exception e) {
+                    routeFeed.fail(e);
+                }
+                if (!routeFeed.url.isEmpty() || !routeFeed.error.isEmpty()) board.feeds.add(routeFeed);
+            }
+            String callingList = String.join(" / ", prefs.callNames);
+
+            // The user's filter hides trains too: record what and why.
+            Tfl.Feed mine = new Tfl.Feed("Your filter");
             List<Tfl.Arrival> result = new ArrayList<>();
             for (Tfl.Arrival a : board.trains) {
-                if (prefs.matches(a)) {
+                String what = a.destination + " at " + HHMM.format(a.sortTime());
+                if (calling) {
+                    if (Tfl.norm(a.destination).equals(Tfl.norm(prefs.stopName))) {
+                        mine.drops.add(new Tfl.Drop("Terminates here", what, ""));
+                        continue;
+                    }
+                    Boolean calls = routes == null ? null : routes.callsAt(stopId, prefs.stopName,
+                            a.destinationId, a.destination, prefs.callIds, prefs.callNames);
+                    if (calls == null) {
+                        a.addNote("Couldn't check whether it calls at " + callingList);
+                        result.add(a);
+                    } else if (calls) {
+                        result.add(a);
+                    } else {
+                        mine.drops.add(new Tfl.Drop("Doesn't call at " + callingList, what, ""));
+                    }
+                } else if (prefs.matches(a)) {
                     result.add(a);
                 } else {
-                    mine.drops.add(new Tfl.Drop("Other destination",
-                            a.destination + " at " + HHMM.format(a.sortTime()), ""));
+                    mine.drops.add(new Tfl.Drop("Other destination", what, ""));
                 }
             }
             mine.raw = board.trains.size();
@@ -223,7 +309,7 @@ public class MainActivity extends Activity {
 
             boolean allFailed = true;
             for (Tfl.Feed f : board.feeds) {
-                if (f != mine && f.error.isEmpty()) allFailed = false;
+                if (f != mine && f != routeFeed && f.error.isEmpty()) allFailed = false;
             }
 
             final boolean failed = allFailed;
@@ -233,6 +319,8 @@ public class MainActivity extends Activity {
                 lastBoard = board;
                 lastBoardAt = at;
                 vehicleCheck.update(board.arrivals, at);
+                platformBook.merge(board);
+                platformBook.save(this, prefs.stopId);
                 if (board.retryAfterSec > 0) {
                     backoffUntil = at.plusSeconds(board.retryAfterSec);
                     main.removeCallbacks(retryAfterBackoff);
@@ -340,7 +428,7 @@ public class MainActivity extends Activity {
         }
 
         StringBuilder sub = new StringBuilder();
-        if (!t.platform.isEmpty()) sub.append(t.platform);
+        if (!t.platform.isEmpty()) sub.append(platformBook.label(t.platform, t.platformDir));
         if (!cancelled && !t.currentLocation.isEmpty()) {
             if (sub.length() > 0) sub.append(" · ");
             sub.append(t.currentLocation);

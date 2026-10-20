@@ -7,11 +7,23 @@ On first launch it asks you to pick:
 
 1. **A line** – Tube lines, Elizabeth line, DLR, London Overground lines or trams.
 2. **Your station** on that line (searchable list).
-3. **Which trains** – tick the destinations you care about (usually the end
-   of the line in your direction), or leave all unticked for every train.
+3. **Which trains** – either by **final destination** (tick the ends of the
+   line you want) or **calling at** (tick stations the train must stop at
+   after yours, whatever its final destination). Leave all unticked for every
+   train. "Calling at" uses TfL's timetabled stopping patterns, fetched once a
+   day per line.
 
 Your choice is stored only on the phone. Tap **Change** on the main screen to
 pick again.
+
+**Starred setups:** tap **☆ Star this** under the header to keep the current
+setup. Starred setups appear as chips in that row: tap one to switch,
+long-press to remove it.
+
+**Platform labels:** platforms are labelled with their direction (when TfL
+names it) and the destinations of trains seen there, e.g.
+"Plat A — eastbound: …". The app learns these as it runs and keeps them on the
+phone.
 
 The main screen lists the next matching trains with departure time, a
 countdown, platform and current location. It refreshes every 30 seconds while

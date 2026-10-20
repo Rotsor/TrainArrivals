@@ -8,7 +8,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.Editable;
 import android.text.TextWatcher;
-import android.util.SparseBooleanArray;
 import android.util.TypedValue;
 import android.view.View;
 import android.widget.AbsListView;
@@ -21,13 +20,18 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
-/** Three-step setup: pick a line, a station on it, then which destinations to show. */
+/**
+ * Three-step setup: pick a line, a station on it, then which trains to show,
+ * either by final destination or by a station they call at.
+ */
 public class SetupActivity extends Activity {
 
     private static final int STEP_LINE = 0, STEP_STATION = 1, STEP_DEST = 2;
@@ -45,6 +49,14 @@ public class SetupActivity extends Activity {
     private int requestSeq = 0;
     private Tfl.Item line, station;
     private ArrayAdapter<Tfl.Item> adapter;
+
+    // Step 3
+    private LinearLayout modeBar;
+    private Button modeDest, modeCalls;
+    private String filterMode = Prefs.MODE_DEST;
+    private List<Tfl.Item> stationItems = new ArrayList<>(), destItems = new ArrayList<>();
+    /** Ticked items by normalised name, kept across searches. */
+    private final Map<String, Tfl.Item> chosen = new LinkedHashMap<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -77,6 +89,7 @@ public class SetupActivity extends Activity {
     private void showLines() {
         step = STEP_LINE;
         setHeader("Step 1 of 3", "Choose a line", null);
+        modeBar.setVisibility(View.GONE);
         search.setVisibility(View.GONE);
         primary.setVisibility(View.GONE);
         load(Tfl::lines, items -> setSingleChoice(items, item -> {
@@ -88,11 +101,12 @@ public class SetupActivity extends Activity {
     private void showStations() {
         step = STEP_STATION;
         setHeader("Step 2 of 3", "Choose your station", line.name);
+        modeBar.setVisibility(View.GONE);
         search.setText("");
         search.setVisibility(View.VISIBLE);
         primary.setVisibility(View.GONE);
         final String lineId = line.id;
-        load(() -> Tfl.stations(lineId), items -> setSingleChoice(items, item -> {
+        load(() -> Tfl.stations(lineId), items -> setSingleChoice(stationItems = items, item -> {
             station = item;
             showDestinations();
         }));
@@ -100,20 +114,68 @@ public class SetupActivity extends Activity {
 
     private void showDestinations() {
         step = STEP_DEST;
-        setHeader("Step 3 of 3", "Which trains?",
-                "Tick the destinations of the trains you want, usually the end of the line "
-                        + "in your direction. Leave all unticked to see every train.");
+        setHeader("Step 3 of 3", "Which trains?", null);
         search.setVisibility(View.GONE);
         primary.setVisibility(View.GONE);
+        modeBar.setVisibility(View.VISIBLE);
         final String lineId = line.id, stopId = station.id;
         load(() -> Tfl.destinations(lineId, stopId), items -> {
-            adapter = new ArrayAdapter<>(this,
-                    android.R.layout.simple_list_item_multiple_choice, new ArrayList<>(items));
-            listView.setChoiceMode(AbsListView.CHOICE_MODE_MULTIPLE);
-            listView.setAdapter(adapter);
-            listView.setOnItemClickListener(null);
-            primary.setVisibility(View.VISIBLE);
+            destItems = items;
+            setMode(filterMode);
         });
+    }
+
+    private void setMode(String mode) {
+        filterMode = mode;
+        chosen.clear();
+        boolean calls = Prefs.MODE_CALLS.equals(mode);
+        styleModeButton(modeDest, !calls);
+        styleModeButton(modeCalls, calls);
+        if (calls) {
+            hint.setText("Tick stations your train must call at after " + station.name
+                    + ". Any train stopping at one of them is shown, whatever its final "
+                    + "destination. Leave all unticked to see every train.");
+            search.setText("");
+            search.setVisibility(View.VISIBLE);
+            List<Tfl.Item> others = new ArrayList<>();
+            for (Tfl.Item it : stationItems) {
+                if (!Tfl.norm(it.name).equals(Tfl.norm(station.name))) others.add(it);
+            }
+            setMultiChoice(others);
+        } else {
+            hint.setText("Tick the final destinations of the trains you want, usually the end "
+                    + "of the line in your direction. Leave all unticked to see every train.");
+            search.setVisibility(View.GONE);
+            setMultiChoice(destItems);
+        }
+        hint.setVisibility(View.VISIBLE);
+    }
+
+    private void setMultiChoice(List<Tfl.Item> items) {
+        adapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_list_item_multiple_choice, new ArrayList<>(items));
+        listView.setChoiceMode(AbsListView.CHOICE_MODE_MULTIPLE);
+        listView.setAdapter(adapter);
+        listView.clearChoices();
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            Tfl.Item it = adapter.getItem(position);
+            if (listView.isItemChecked(position)) chosen.put(Tfl.norm(it.name), it);
+            else chosen.remove(Tfl.norm(it.name));
+        });
+        primary.setVisibility(View.VISIBLE);
+    }
+
+    /** After a search narrows the list, tick what was chosen before. */
+    private void reapplyChecks() {
+        listView.clearChoices();
+        for (int i = 0; i < adapter.getCount(); i++) {
+            if (chosen.containsKey(Tfl.norm(adapter.getItem(i).name))) listView.setItemChecked(i, true);
+        }
+    }
+
+    private void styleModeButton(Button b, boolean active) {
+        b.setTextColor(active ? 0xFFFFFFFF : getColor(R.color.muted));
+        b.setBackgroundColor(active ? getColor(R.color.purple) : getColor(R.color.card));
     }
 
     private void save() {
@@ -122,13 +184,11 @@ public class SetupActivity extends Activity {
         p.lineName = line.name;
         p.stopId = station.id;
         p.stopName = station.name;
-        SparseBooleanArray checked = listView.getCheckedItemPositions();
-        for (int i = 0; i < adapter.getCount(); i++) {
-            if (checked != null && checked.get(i)) {
-                Tfl.Item d = adapter.getItem(i);
-                p.destNames.add(d.name);
-                if (!d.id.isEmpty()) p.destIds.add(d.id);
-            }
+        p.mode = filterMode;
+        boolean calls = Prefs.MODE_CALLS.equals(filterMode);
+        for (Tfl.Item it : chosen.values()) {
+            (calls ? p.callNames : p.destNames).add(it.name);
+            if (!it.id.isEmpty()) (calls ? p.callIds : p.destIds).add(it.id);
         }
         p.save(this);
         startActivity(new Intent(this, MainActivity.class)
@@ -218,6 +278,26 @@ public class SetupActivity extends Activity {
         hint.setPadding(dp(20), dp(12), dp(20), 0);
         root.addView(hint);
 
+        modeBar = new LinearLayout(this);
+        modeBar.setOrientation(LinearLayout.HORIZONTAL);
+        modeBar.setPadding(dp(16), dp(12), dp(16), 0);
+        modeDest = new Button(this);
+        modeDest.setText("Final destination");
+        modeCalls = new Button(this);
+        modeCalls.setText("Calling at");
+        for (Button b : new Button[]{modeDest, modeCalls}) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            lp.setMargins(dp(2), 0, dp(2), 0);
+            b.setLayoutParams(lp);
+            b.setAllCaps(false);
+            modeBar.addView(b);
+        }
+        modeDest.setOnClickListener(v -> setMode(Prefs.MODE_DEST));
+        modeCalls.setOnClickListener(v -> setMode(Prefs.MODE_CALLS));
+        modeBar.setVisibility(View.GONE);
+        root.addView(modeBar);
+
         search = new EditText(this);
         search.setHint("Search stations");
         search.setSingleLine(true);
@@ -231,7 +311,12 @@ public class SetupActivity extends Activity {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void afterTextChanged(Editable s) {
-                if (adapter != null && step == STEP_STATION) adapter.getFilter().filter(s);
+                if (adapter == null) return;
+                if (step == STEP_STATION) {
+                    adapter.getFilter().filter(s);
+                } else if (step == STEP_DEST && Prefs.MODE_CALLS.equals(filterMode)) {
+                    adapter.getFilter().filter(s, count -> reapplyChecks());
+                }
             }
         });
         root.addView(search);

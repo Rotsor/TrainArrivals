@@ -16,6 +16,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -82,6 +83,8 @@ final class Tfl {
         String destination = "";
         String destinationId = "";
         String currentLocation = "";
+        /** "eastbound" etc. when TfL's platform name says so; "" otherwise. */
+        String platformDir = "";
         /** TfL arrivals feed's vehicleId; "" if none. Being checked for stability. */
         String vehicleId = "";
         /** "", OnTime, Delayed, Cancelled or NotStoppingAtStation. */
@@ -114,6 +117,20 @@ final class Tfl {
         Feed depFeed, arrFeed, nrFeed;
         /** The arrivals feed's trains for this line (all destinations); null if it failed. */
         List<Arrival> arrivals;
+        /** Platform label → destinations seen there (with counts) this refresh, all feeds. */
+        final Map<String, Map<String, Integer>> platformDests = new LinkedHashMap<>();
+        /** Platform label → direction, when a feed names it. */
+        final Map<String, String> platformDirs = new HashMap<>();
+
+        void recordPlatforms(List<Arrival> trains) {
+            if (trains == null) return;
+            for (Arrival a : trains) {
+                if (a.platform.isEmpty() || a.destination.isEmpty()) continue;
+                platformDests.computeIfAbsent(a.platform, k -> new LinkedHashMap<>())
+                        .merge(a.destination, 1, Integer::sum);
+                if (!a.platformDir.isEmpty()) platformDirs.put(a.platform, a.platformDir);
+            }
+        }
         /** Seconds TfL asked us to wait before trying again; 0 if not rate limited. */
         int retryAfterSec = 0;
         /** Every feed requested, in display order. */
@@ -293,6 +310,7 @@ final class Tfl {
             a.expected = when;
             a.lineId = o.optString("lineId");
             a.platform = cleanPlatform(o.optString("platformName", ""));
+            a.platformDir = platformDirection(o.optString("platformName", ""));
             a.destination = dest.isEmpty() ? cleanName(o.optString("towards", "")) : dest;
             a.destinationId = o.optString("destinationNaptanId", "");
             String loc = o.optString("currentLocation", "");
@@ -303,6 +321,11 @@ final class Tfl {
         out.sort((a, b) -> a.expected.compareTo(b.expected));
         f.kept = out.size();
         return out;
+    }
+
+    /** Raw stopping-pattern data for a line (parsed by Routes). */
+    static String routeSequence(String lineId, Feed f) throws Exception {
+        return request(f, "/Line/" + enc(lineId) + "/Route/Sequence/all?serviceTypes=Regular");
     }
 
     /** TfL's departure board for rail lines: includes status and timetabled times. */
@@ -347,6 +370,7 @@ final class Tfl {
             a.destination = dest;
             a.destinationId = str(o, "destinationNaptanId");
             a.platform = cleanPlatform(o.optString("platformName", ""));
+            a.platformDir = platformDirection(o.optString("platformName", ""));
             a.status = str(o, "departureStatus");
             f.statuses.merge(a.status.isEmpty() ? "(none)" : a.status, 1, Integer::sum);
             a.cause = str(o, "cause");
@@ -374,6 +398,7 @@ final class Tfl {
         if (!hasDepartureBoard(lineId)) {
             List<Arrival> arrs = tryArrivals(stopId, lineId, b.arrFeed, b);
             b.arrivals = arrs == null ? null : new ArrayList<>(arrs);
+            b.recordPlatforms(arrs);
             if (arrs != null) b.trains = arrs;
             else b.sourceNote = "Arrivals feed failed: " + b.arrFeed.error;
             return b;
@@ -413,6 +438,10 @@ final class Tfl {
                 b.nrFeed.fail(e);
             }
         }
+
+        b.recordPlatforms(deps);
+        b.recordPlatforms(arrs);
+        b.recordPlatforms(nr);
 
         List<String> notes = new ArrayList<>();
         if (deps == null) notes.add("TfL departure board failed (" + b.depFeed.error + ")");
@@ -768,6 +797,14 @@ final class Tfl {
 
     static String norm(String s) {
         return cleanName(s).toLowerCase(Locale.UK).replaceAll("[^a-z0-9]", "");
+    }
+
+    /** "Eastbound - Platform A" → "eastbound"; "" if no direction is named. */
+    static String platformDirection(String p) {
+        if (p == null) return "";
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?i)\\b(east|west|north|south)bound\\b|\\b(inner|outer) rail\\b").matcher(p);
+        return m.find() ? m.group().toLowerCase(Locale.UK) : "";
     }
 
     private static String cleanPlatform(String p) {
