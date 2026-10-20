@@ -451,36 +451,49 @@ final class Tfl {
         }
     }
 
-    /** Pair up the same train in both feeds, then note any disagreement. */
+    /** A train this close to leaving, gone from the arrivals feed, has probably arrived. */
+    static final long AT_PLATFORM_WINDOW_SEC = 3 * 60;
+
     private static void crossCheck(List<Arrival> deps, List<Arrival> arrs) {
+        crossCheck(deps, arrs, Instant.now());
+    }
+
+    /** Pair up the same train in both feeds, then note any disagreement. */
+    static void crossCheck(List<Arrival> deps, List<Arrival> arrs, Instant now) {
         final long matchWindow = 5 * 60;   // seconds: further apart = different trains
         final long reportGap = 3 * 60;     // seconds: arrival vs departure differ a little anyway
-        boolean[] used = new boolean[arrs.size()];
         DateTimeFormatter hhmm = DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.of("Europe/London"));
-        Instant horizon = null;
+        int[] match = pairClosest(deps, arrs, (d, a) -> {
+            if (!norm(a.destination).equals(norm(d.destination))) return -1L;
+            long gap = Long.MAX_VALUE;
+            if (d.expected != null) gap = Math.min(gap, secsBetween(a.expected, d.expected));
+            if (d.scheduled != null) gap = Math.min(gap, secsBetween(a.expected, d.scheduled));
+            return gap <= matchWindow ? gap : -1L;
+        });
+        boolean[] used = new boolean[arrs.size()];
+        Instant horizon = null, firstArrival = null;
         for (Arrival a : arrs) {
             if (horizon == null || a.expected.isAfter(horizon)) horizon = a.expected;
+            if (firstArrival == null || a.expected.isBefore(firstArrival)) firstArrival = a.expected;
         }
 
-        for (Arrival d : deps) {
-            int best = -1;
-            long bestGap = Long.MAX_VALUE;
-            for (int i = 0; i < arrs.size(); i++) {
-                if (used[i]) continue;
-                Arrival a = arrs.get(i);
-                if (!norm(a.destination).equals(norm(d.destination))) continue;
-                long gap = Long.MAX_VALUE;
-                if (d.expected != null) gap = Math.min(gap, secsBetween(a.expected, d.expected));
-                if (d.scheduled != null) gap = Math.min(gap, secsBetween(a.expected, d.scheduled));
-                if (gap <= matchWindow && gap < bestGap) {
-                    best = i;
-                    bestGap = gap;
-                }
-            }
+        for (int di = 0; di < deps.size(); di++) {
+            Arrival d = deps.get(di);
+            int best = match[di];
 
             if (best < 0) {
-                // The arrivals feed only looks ~30 min ahead; beyond that, absence means nothing.
-                if (!d.isCancelled() && horizon != null && !d.sortTime().isAfter(horizon)) {
+                if (d.isCancelled()) continue;
+                // The arrivals feed counts down to arrival and drops a train once it
+                // gets in, while the departure board keeps it until it leaves. So a
+                // train about to leave, ahead of everything in the arrivals feed, has
+                // most likely arrived. Inferred, not confirmed: no feed says so.
+                boolean aboutToLeave = !d.sortTime().isAfter(now.plusSeconds(AT_PLATFORM_WINDOW_SEC));
+                boolean aheadOfFeed = firstArrival == null || !d.sortTime().isAfter(firstArrival);
+                if (aboutToLeave && aheadOfFeed) {
+                    if (d.currentLocation.isEmpty()) d.currentLocation = "Probably at the platform";
+                } else if (horizon != null && !d.sortTime().isAfter(horizon)) {
+                    // Within the feed's ~30 min range, yet missing: genuinely odd.
+                    // Beyond that range, absence means nothing.
                     d.addNote("Not in the arrivals feed");
                 }
                 continue;
@@ -618,6 +631,15 @@ final class Tfl {
      */
     private static void crossCheckNationalRail(List<Arrival> primary, List<Arrival> nr, Feed f) {
         final long schedWindow = 2 * 60, expWindow = 5 * 60, reportGap = 3 * 60;
+        int[] match = pairClosest(primary, nr, (p, n) -> {
+            if (!norm(n.destination).equals(norm(p.destination))) return -1L;
+            if (p.scheduled != null) {
+                long gap = secsBetween(p.scheduled, n.scheduled);
+                return gap <= schedWindow ? gap : -1L;
+            }
+            long gap = secsBetween(p.sortTime(), n.sortTime());
+            return gap <= expWindow ? gap : -1L;
+        });
         boolean[] used = new boolean[nr.size()];
         Instant primaryEnd = null, nrEnd = null;
         for (Arrival p : primary) {
@@ -627,26 +649,11 @@ final class Tfl {
             if (nrEnd == null || n.sortTime().isAfter(nrEnd)) nrEnd = n.sortTime();
         }
 
-        for (Arrival p : primary) {
-            int best = -1;
-            long bestGap = Long.MAX_VALUE;
-            for (int i = 0; i < nr.size(); i++) {
-                if (used[i]) continue;
-                Arrival n = nr.get(i);
-                if (!norm(n.destination).equals(norm(p.destination))) continue;
-                long gap;
-                if (p.scheduled != null) {
-                    gap = secsBetween(p.scheduled, n.scheduled);
-                    if (gap > schedWindow) continue;
-                } else {
-                    gap = secsBetween(p.sortTime(), n.sortTime());
-                    if (gap > expWindow) continue;
-                }
-                if (gap < bestGap) {
-                    best = i;
-                    bestGap = gap;
-                }
-            }
+        // Only the trains that were in the list before this check (none added yet).
+        int primaryCount = primary.size();
+        for (int pi = 0; pi < primaryCount; pi++) {
+            Arrival p = primary.get(pi);
+            int best = match[pi];
 
             if (best < 0) {
                 if (!p.isCancelled() && nrEnd != null && !p.sortTime().isAfter(nrEnd)) {
@@ -690,6 +697,34 @@ final class Tfl {
             }
         }
         primary.sort((x, y) -> x.sortTime().compareTo(y.sortTime()));
+    }
+
+    /**
+     * Pair trains in two lists, closest pairs first, each train used at most
+     * once. gap(a, b) is the distance in seconds, or -1 if they can't be the
+     * same train. Returns, for each train in `as`, the index in `bs` or -1.
+     */
+    static int[] pairClosest(List<Arrival> as, List<Arrival> bs,
+                             java.util.function.BiFunction<Arrival, Arrival, Long> gap) {
+        List<long[]> pairs = new ArrayList<>(); // {gap, ai, bi}
+        for (int i = 0; i < as.size(); i++) {
+            for (int j = 0; j < bs.size(); j++) {
+                long g = gap.apply(as.get(i), bs.get(j));
+                if (g >= 0) pairs.add(new long[]{g, i, j});
+            }
+        }
+        pairs.sort((x, y) -> x[0] != y[0] ? Long.compare(x[0], y[0])
+                : x[1] != y[1] ? Long.compare(x[1], y[1]) : Long.compare(x[2], y[2]));
+        int[] match = new int[as.size()];
+        java.util.Arrays.fill(match, -1);
+        boolean[] bUsed = new boolean[bs.size()];
+        for (long[] pr : pairs) {
+            int i = (int) pr[1], j = (int) pr[2];
+            if (match[i] >= 0 || bUsed[j]) continue;
+            match[i] = j;
+            bUsed[j] = true;
+        }
+        return match;
     }
 
     private static long secsBetween(Instant a, Instant b) {
